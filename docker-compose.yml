@@ -1,0 +1,178 @@
+# docker-compose.yml auth-service/docker-compose.yml
+# =============================================================================
+# Auth-Service Stack (PROD Default)
+#
+# Ziele / Prinzipien:
+# - Keine Host-Ports: nur internes Routing (nginx-gateway ↔ auth-service)
+# - Secrets ausschließlich via Docker-Secrets (/run/secrets/*)
+# - Netzwerk-Trennung:
+#   * paradox_net       = App/Edge (Gateway, Services, Portal)
+#   * paradox_backplane = Infra (DB, Redis, Mailpit, etc.)
+# - Hardening: read-only FS, tmpfs, no-new-privileges, cap_drop, pids_limit
+# - Stabiler Betrieb: Healthcheck, init: true, restart policy
+#
+# Voraussetzungen:
+# - Externe Netze existieren:
+#   docker network create paradox_net
+#   docker network create paradox_backplane
+# - Secret-Dateien existieren und chmod 600:
+#   /home/devops/secrets/auth_database_url.txt
+#   /home/devops/secrets/redis_password.txt
+#   /home/devops/secrets/jwt_secret.txt
+#   /home/devops/secrets/smtp_user.txt
+#   /home/devops/secrets/smtp_password.txt
+#
+# WICHTIG:
+# - jwt_secret.txt muss IDENTISCH für auth-service UND profile-service sein,
+#   sonst kann profile-service Tokens nicht verifizieren.
+# =============================================================================
+
+name: auth-service-stack
+
+# -----------------------------------------------------------------------------
+# Reusable Healthcheck (Service-intern)
+# -----------------------------------------------------------------------------
+x-healthcheck: &hc
+  test:
+    - CMD
+    - node
+    - -e
+    - >
+      const p = process.env.PORT || 3000;
+      fetch('http://127.0.0.1:' + p + '/healthz')
+        .then(r => process.exit(r.ok ? 0 : 1))
+        .catch(() => process.exit(1));
+  interval: 10s
+  timeout: 3s
+  retries: 10
+  start_period: 5s
+
+services:
+  auth-service:
+    # -------------------------------------------------------------------------
+    # Build / Runtime
+    # -------------------------------------------------------------------------
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # image: auth-service:local   # optional, falls du ein fixes Tag willst
+
+    init: true
+
+    # Nur aktiv lassen, wenn dein Image wirklich als non-root laufen soll/kann.
+    # Falls dein Dockerfile bereits USER node setzt, kannst du diese Zeile entfernen.
+    user: "1000:1000"
+
+    # -------------------------------------------------------------------------
+    # Environment (keine Secrets direkt hier!)
+    # -------------------------------------------------------------------------
+    environment:
+      NODE_ENV: "production"
+
+      # Fail-fast Validierung nur beim Container-Start (nicht bei Tests/Build)
+      STARTUP_VALIDATE_ENV: "1"
+
+      HOST: "0.0.0.0"
+      PORT: "3000"
+
+      # Secrets via Docker-Secrets
+      # auth_database_url muss auf stabilen DB-Alias zeigen, z. B.:
+      # postgresql://auth_runtime:<pw>@auth-db:5432/authdb
+      # Nicht auf ephemere Container-Namen wie db-auth26-postgres-1.
+      DATABASE_URL_FILE: "/run/secrets/auth_database_url"
+      REDIS_PASSWORD_FILE: "/run/secrets/redis_password"
+      JWT_SECRET_ACTIVE_FILE: "/run/secrets/jwt_secret"
+      # Optional fuer Rotation:
+      # JWT_SECRET_PREVIOUS_FILE: "/run/secrets/jwt_secret_previous"
+
+      # SMTP optional (Mailpit oder Relay)
+      SMTP_USER_FILE: "/run/secrets/smtp_user"
+      SMTP_PASS_FILE: "/run/secrets/smtp_password"
+      SMTP_HOST: "mailpit"
+      SMTP_PORT: "1025"
+      SMTP_SECURE: "false"
+      SMTP_FROM: "Auth Service <no-reply@local.test>"
+
+      # Redis Discovery (im backplane)
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_USERNAME: "svc"
+      REDIS_NAMESPACE: "paradox"
+
+      # JWT Claims (müssen zu Consumers passen)
+      JWT_ISSUER: "auth-service"
+      JWT_AUDIENCE: "auth-client"
+
+      # CORS (Portal/Gateway Origin)
+      CORS_ORIGIN: "http://localhost:8080"
+      REQUEST_ID_HEADER: "x-request-id"
+      OPENAPI_ENABLED: "true"
+      METRICS_ENABLED: "true"
+
+      ENABLE_DEBUG_HEADERS: "false"
+      LOG_LEVEL: "info"
+
+    # -------------------------------------------------------------------------
+    # Docker-Secrets Mounts
+    # -------------------------------------------------------------------------
+    secrets:
+      - auth_database_url
+      - redis_password
+      - jwt_secret
+      - smtp_user
+      - smtp_password
+
+    # Nur intern erreichbar
+    expose:
+      - "3000"
+
+    # -------------------------------------------------------------------------
+    # Hardening
+    # -------------------------------------------------------------------------
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    pids_limit: 200
+    restart: unless-stopped
+    healthcheck: *hc
+
+    # -------------------------------------------------------------------------
+    # Networks
+    # -------------------------------------------------------------------------
+    networks:
+      paradox_net:
+        aliases:
+          - auth-service
+      paradox_backplane: {}
+
+# -----------------------------------------------------------------------------
+# Secrets (Dateien auf dem Host, nur von Docker als /run/secrets/* bereitgestellt)
+# -----------------------------------------------------------------------------
+secrets:
+  auth_database_url:
+    file: /home/devops/secrets/auth_database_url.txt
+  redis_password:
+    file: /home/devops/secrets/redis_password.txt
+  jwt_secret:
+    file: /home/devops/secrets/jwt_secret.txt
+  smtp_user:
+    file: /home/devops/secrets/smtp_user.txt
+  smtp_password:
+    file: /home/devops/secrets/smtp_password.txt
+
+# -----------------------------------------------------------------------------
+# External Networks
+# -----------------------------------------------------------------------------
+networks:
+  paradox_net:
+    external: true
+    name: paradox_net
+  paradox_backplane:
+    external: true
+    name: paradox_backplane

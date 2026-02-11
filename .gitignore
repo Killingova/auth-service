@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.prod
+.env.*.local
+*.log
+_backup/
+_local/

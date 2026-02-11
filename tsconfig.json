@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    /* Zielplattform/Standardbibliothek */
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    /* ESM in Node: TypeScript löst *.ts auf, emittiert *.js und erwartet .js-Suffix in Imports */
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    /* Interop & strenge Typisierung */
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "skipLibCheck": true,
+
+    /* Node-Typen & JSON-Imports */
+    "types": ["node"],
+    "resolveJsonModule": true,
+
+    /* Ausgabeordner */
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts", "src/types/**/*.d.ts"]
+}

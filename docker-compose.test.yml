@@ -1,0 +1,34 @@
+name: auth-service-e2e
+
+services:
+  postgres-test:
+    image: postgres:17.6
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: authdb
+      TZ: UTC
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - ../db-auth26/db/init:/docker-entrypoint-initdb.d:ro
+      - ./docker/e2e/secrets/auth_runtime_password.txt:/run/secrets/auth_runtime_password.txt:ro
+      - ./docker/e2e/secrets/auth_migrator_password.txt:/run/secrets/auth_migrator_password.txt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d authdb || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  redis-test:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--requirepass", "redis-test"]
+    ports:
+      - "127.0.0.1:56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis-test", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
