@@ -2,6 +2,8 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../../app.js";
+import { hashEmailForLog } from "../../libs/pii.js";
+import { acquireShortLock, releaseShortLock } from "../../libs/redis.js";
 
 const TENANT_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -46,6 +48,36 @@ describe("Password routes", () => {
     });
 
     expect(res.statusCode).toBe(400);
+  });
+
+  it("POST /auth/password/forgot returns 409 when lock is held", async () => {
+    const lock = await acquireShortLock({
+      tenantId: TENANT_ID,
+      scope: "pwreset_request",
+      resource: hashEmailForLog("locked@example.test"),
+      ttlMs: 30_000,
+    });
+    expect(lock.acquired).toBe(true);
+    expect(lock.lock).toBeDefined();
+
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/auth/password/forgot",
+        headers: {
+          "x-tenant-id": TENANT_ID,
+        },
+        payload: {
+          email: "locked@example.test",
+        },
+      });
+
+      expect(res.statusCode).toBe(409);
+      const body = res.json() as any;
+      expect(body.error?.code).toBe("PASSWORD_RESET_IN_PROGRESS");
+    } finally {
+      if (lock.lock) await releaseShortLock(lock.lock);
+    }
   });
 
   it("POST /auth/password/change returns 401 when token is missing", async () => {

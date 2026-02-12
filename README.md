@@ -3,11 +3,42 @@ Auth-Service (Fastify, PostgreSQL, Redis)
 
 Dieser Dienst stellt einen mandantenfähigen Auth‑Service bereit: Login, Registrierung, E‑Mail‑Verifikation, Passwort‑Reset, Magic‑Link, OTP, Sessions, Tenants und Token‑Cleanup. Er ist auf Fastify v5 aufgebaut und nutzt PostgreSQL (auth‑Schema) und Redis.
 
-## Aktueller Stand (2026-02-12 14:37:47 CET)
+## Zweck / Boundary
+- Authentifizierung und Session-/Token-Management pro Tenant.
+- Redis als kurzlebiger State-Layer (Blacklist, Rate, Locks), PostgreSQL bleibt Source of Truth.
+- Kein direkter Public-Zugriff auf DB/Redis, nur via API/Gateway.
+
+## Aktueller Stand (2026-02-12 15:57:21 CET)
 
 - Container `auth-service-stack-auth-service-1` laeuft `healthy`.
 - Gateway-Check `https://127.0.0.1:8443/auth/healthz` liefert `200`.
 - Redis-Key-Schema ist tenant-basiert (`tenant:{tenantId}:auth:*`), Legacy-Namespace ist entfernt.
+- Redis-Usecases aktiv: `jti blacklist`, tenant-aware `rate counters`, `idempotency keys` (Redis+DB) und kurze `locks` fuer `password reset`/`otp`.
+
+## Security Contract
+- `x-tenant-id` ist fuer tenant-gebundene Routen Pflicht.
+- JWT Access-Tokens werden validiert, revokte JTIs werden ueber Redis geprueft.
+- Secrets nur via `*_FILE`, keine Klartext-Secrets im Repo.
+
+## Ops
+- Start/Build: `docker compose up -d --build`
+- Health: `GET /healthz`, `GET /health`, `GET /readyz`
+- Diagnose: `docker compose logs -f auth-service`
+
+## DoD Checks
+```bash
+curl -ks https://127.0.0.1:8443/auth/healthz
+curl -ks https://127.0.0.1:8443/health/auth
+curl -ks https://127.0.0.1:8443/healthz
+```
+
+Erwartung:
+- Health-Endpunkte liefern `200`.
+
+## Guardrails
+- Kein Legacy-Redis-Namespace (`paradox:*`) mehr verwenden.
+- Keine Klartext-Tokens oder PII in Redis.
+- Keine Umgehung von Tenant- und JWT-Guards.
 
 Die wichtigsten Bausteine:
 

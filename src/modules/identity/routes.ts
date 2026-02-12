@@ -61,6 +61,9 @@ const RefreshBodySchema = z.object({
 
 type RefreshBody = z.infer<typeof RefreshBodySchema>;
 
+const LOGIN_FAILURE_DELAY_MIN_MS = 200;
+const LOGIN_FAILURE_DELAY_MAX_MS = 400;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -78,6 +81,14 @@ function requireDb(app: FastifyInstance, req: any, reply: any): DbClient | null 
     return null;
   }
   return db;
+}
+
+async function applyLoginFailureDelay(): Promise<void> {
+  const jitter = Math.floor(
+    Math.random() * (LOGIN_FAILURE_DELAY_MAX_MS - LOGIN_FAILURE_DELAY_MIN_MS + 1),
+  );
+  const total = LOGIN_FAILURE_DELAY_MIN_MS + jitter;
+  await new Promise((resolve) => setTimeout(resolve, total));
 }
 
 export default async function identityRoutes(app: FastifyInstance) {
@@ -116,6 +127,7 @@ export default async function identityRoutes(app: FastifyInstance) {
         );
         if (lockState.locked) {
           recordAuthLogin(false);
+          await applyLoginFailureDelay();
           return sendApiError(
             reply,
             401,
@@ -165,6 +177,7 @@ export default async function identityRoutes(app: FastifyInstance) {
           access_expires_at: result.accessTokenExpiresAt,
           refresh_token: result.refreshToken,
           refresh_expires_at: result.refreshTokenExpiresAt,
+          session_id: result.sessionId,
           token_type: "bearer",
           user: result.user,
         });
@@ -191,6 +204,7 @@ export default async function identityRoutes(app: FastifyInstance) {
           app.log.warn({ err: lockErr }, "login_soft_lock_increment_failed");
         }
 
+        await applyLoginFailureDelay();
         return sendApiError(
           reply,
           401,
@@ -307,6 +321,12 @@ export default async function identityRoutes(app: FastifyInstance) {
         cached,
         claims: {
           jti,
+          sid: user.sid,
+          ver: user.ver ?? 1,
+          role: user.role,
+          roles: user.roles ?? [],
+          plan: user.plan,
+          scope: user.scope,
           exp: user.exp,
           iat: user.iat,
         },

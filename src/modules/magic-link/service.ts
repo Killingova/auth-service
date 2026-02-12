@@ -97,7 +97,9 @@ export async function consumeMagicLink(
 
   await deleteMagicLinkTokenById(db, tokenRow.id);
 
+  const sessionId = randomUUID();
   await createSession(db, {
+    sessionId,
     tenantId: user.tenant_id,
     userId: user.id,
     ttlSec: ACCESS_TTL_SEC,
@@ -107,6 +109,10 @@ export async function consumeMagicLink(
     user.id,
     user.tenant_id,
     ACCESS_TTL_SEC,
+    {
+      sid: sessionId,
+      ver: 1,
+    },
   );
 
   const refreshToken = randomUUID();
@@ -116,6 +122,7 @@ export async function consumeMagicLink(
     userId: user.id,
     tokenHash: refreshTokenHash,
     ttlSec: REFRESH_TTL_SEC,
+    familyId: sessionId,
   });
 
   return {

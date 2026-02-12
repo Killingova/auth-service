@@ -24,8 +24,13 @@ import {
   writeIdempotentResponse,
 } from "../../libs/idempotency.js";
 import { appendOutboxEvent } from "../../libs/outbox.js";
-import { hashEmailForLog } from "../../libs/pii.js";
-import { streamAdd } from "../../libs/redis.js";
+import { hashEmailForLog, sha256 } from "../../libs/pii.js";
+import {
+  acquireShortLock,
+  releaseShortLock,
+  streamAdd,
+  type RedisLockHandle,
+} from "../../libs/redis.js";
 import { verifyAccessToken, type AccessTokenPayload } from "../../libs/jwt.js";
 
 import {
@@ -73,6 +78,9 @@ const ChangePasswordBodySchema = z.object({
 
 type ChangePasswordBody = z.infer<typeof ChangePasswordBodySchema>;
 
+const PASSWORD_RESET_REQUEST_LOCK_TTL_MS = 30_000;
+const PASSWORD_RESET_CONFIRM_LOCK_TTL_MS = 60_000;
+
 // ---------------------------------------------------------------------------
 // Routen-Plugin
 // ---------------------------------------------------------------------------
@@ -104,56 +112,96 @@ export default async function passwordRoutes(app: FastifyInstance) {
     "/forgot",
     { config: { tenant: true, auth: false } },
     async (req, reply) => {
-    const parsed = ForgotPasswordBodySchema.safeParse(req.body);
+      const parsed = ForgotPasswordBodySchema.safeParse(req.body);
 
-    if (!parsed.success) {
-      const errorDetails = parsed.error.flatten();
-      return reply.code(400).send({
-        error: {
-          code: "PASSWORD_FORGOT_VALIDATION_FAILED",
-          message: "Ungültige Eingabe für Passwort-Reset.",
-          details: errorDetails,
-        },
-        statusCode: 400,
-      });
-    }
-
-    const { email } = parsed.data;
-    const db = (req as any).db as DbClient | undefined;
-    const tenantId = (req as any).requestedTenantId as string | undefined;
-    const idempotencyKey = getIdempotencyKey(req.headers["idempotency-key"]);
-
-    if (!db) {
-      app.log.error("password_forgot_missing_db_client");
-      return reply.code(500).send({
-        error: {
-          code: "INTERNAL_DB_CONTEXT_MISSING",
-          message: "Database context not available for this request.",
-        },
-        statusCode: 500,
-      });
-    }
-
-    if (tenantId && idempotencyKey) {
-      const existing = await readIdempotentResponse(db, {
-        tenantId,
-        endpoint: "POST:/auth/password/forgot",
-        idempotencyKey,
-      });
-
-      if (existing) {
-        return reply.code(existing.status_code).send(existing.response_body);
+      if (!parsed.success) {
+        const errorDetails = parsed.error.flatten();
+        return reply.code(400).send({
+          error: {
+            code: "PASSWORD_FORGOT_VALIDATION_FAILED",
+            message: "Ungültige Eingabe für Passwort-Reset.",
+            details: errorDetails,
+          },
+          statusCode: 400,
+        });
       }
-    }
 
-    try {
-      const result = await requestPasswordReset(db, {
-        email,
-        ip: req.ip,
-        ua: req.headers["user-agent"],
-      });
+      const { email } = parsed.data;
+      const db = (req as any).db as DbClient | undefined;
+      const tenantId = (req as any).requestedTenantId as string | undefined;
+      const idempotencyKey = getIdempotencyKey(req.headers["idempotency-key"]);
 
-      if (tenantId) {
+      if (!db) {
+        app.log.error("password_forgot_missing_db_client");
+        return reply.code(500).send({
+          error: {
+            code: "INTERNAL_DB_CONTEXT_MISSING",
+            message: "Database context not available for this request.",
+          },
+          statusCode: 500,
+        });
+      }
+
+      if (!tenantId) {
+        app.log.error("password_forgot_missing_tenant");
+        return reply.code(400).send({
+          error: {
+            code: "TENANT_REQUIRED",
+            message: "Tenant context is required.",
+          },
+          statusCode: 400,
+        });
+      }
+
+      let redisLock: RedisLockHandle | undefined;
+      try {
+        const lock = await acquireShortLock({
+          tenantId,
+          scope: "pwreset_request",
+          resource: hashEmailForLog(email),
+          ttlMs: PASSWORD_RESET_REQUEST_LOCK_TTL_MS,
+        });
+
+        if (!lock.acquired || !lock.lock) {
+          return reply.code(409).send({
+            error: {
+              code: "PASSWORD_RESET_IN_PROGRESS",
+              message: "Password reset request already in progress.",
+            },
+            statusCode: 409,
+          });
+        }
+        redisLock = lock.lock;
+      } catch (err) {
+        app.log.warn({ err }, "password_forgot_lock_acquire_failed");
+        return reply.code(503).send({
+          error: {
+            code: "LOCK_UNAVAILABLE",
+            message: "Temporary lock service unavailable.",
+          },
+          statusCode: 503,
+        });
+      }
+
+      try {
+        if (idempotencyKey) {
+          const existing = await readIdempotentResponse(db, {
+            tenantId,
+            endpoint: "POST:/auth/password/forgot",
+            idempotencyKey,
+          });
+
+          if (existing) {
+            return reply.code(existing.status_code).send(existing.response_body);
+          }
+        }
+
+        const result = await requestPasswordReset(db, {
+          email,
+          ip: req.ip,
+          ua: req.headers["user-agent"],
+        });
+
         await appendOutboxEvent(db, {
           tenantId,
           eventType: "auth.password_reset_requested",
@@ -163,39 +211,48 @@ export default async function passwordRoutes(app: FastifyInstance) {
           },
           idempotencyKey,
         });
+
+        // Event für Worker / Audit – E-Mail nur gehasht
+        try {
+          await streamAdd(
+            "auth-events",
+            {
+              type: "password_reset_requested",
+              email_hash: hashEmailForLog(email),
+              status: result.requestAccepted ? "accepted" : "ignored",
+            },
+            tenantId,
+          );
+        } catch (err) {
+          app.log.warn({ err }, "password_forgot_stream_failed");
+        }
+
+        // Generische Antwort – kein Leak, ob E-Mail existiert.
+        const responseBody = {
+          ok: true,
+          requestAccepted: result.requestAccepted,
+        };
+
+        if (idempotencyKey) {
+          await writeIdempotentResponse(db, {
+            tenantId,
+            endpoint: "POST:/auth/password/forgot",
+            idempotencyKey,
+            statusCode: 200,
+            responseBody,
+          });
+        }
+
+        return reply.code(200).send(responseBody);
+      } finally {
+        if (redisLock) {
+          try {
+            await releaseShortLock(redisLock);
+          } catch (err) {
+            app.log.warn({ err }, "password_forgot_lock_release_failed");
+          }
+        }
       }
-
-      // Event für Worker / Audit – E-Mail nur gehasht
-      try {
-        await streamAdd("auth-events", {
-          type: "password_reset_requested",
-          email_hash: hashEmailForLog(email),
-          status: result.requestAccepted ? "accepted" : "ignored",
-        }, tenantId);
-      } catch (err) {
-        app.log.warn({ err }, "password_forgot_stream_failed");
-      }
-
-      // Generische Antwort – kein Leak, ob E-Mail existiert.
-      const responseBody = {
-        ok: true,
-        requestAccepted: result.requestAccepted,
-      };
-
-      if (tenantId && idempotencyKey) {
-        await writeIdempotentResponse(db, {
-          tenantId,
-          endpoint: "POST:/auth/password/forgot",
-          idempotencyKey,
-          statusCode: 200,
-          responseBody,
-        });
-      }
-
-      return reply.code(200).send(responseBody);
-    } catch (err) {
-      throw err;
-    }
     },
   );
 
@@ -211,83 +268,136 @@ export default async function passwordRoutes(app: FastifyInstance) {
     "/reset",
     { config: { tenant: true, auth: false } },
     async (req, reply) => {
-    const parsed = ResetPasswordBodySchema.safeParse(req.body);
+      const parsed = ResetPasswordBodySchema.safeParse(req.body);
 
-    if (!parsed.success) {
-      const errorDetails = parsed.error.flatten();
-      return reply.code(400).send({
-        error: {
-          code: "PASSWORD_RESET_VALIDATION_FAILED",
-          message: "Ungültige Eingabe für Passwort-Reset.",
-          details: errorDetails,
-        },
-        statusCode: 400,
-      });
-    }
-
-    const { token, new_password } = parsed.data;
-    const db = (req as any).db as DbClient | undefined;
-    const tenantId = (req as any).requestedTenantId as string | undefined;
-
-    if (!db) {
-      app.log.error("password_reset_missing_db_client");
-      return reply.code(500).send({
-        error: {
-          code: "INTERNAL_DB_CONTEXT_MISSING",
-          message: "Database context not available for this request.",
-        },
-        statusCode: 500,
-      });
-    }
-
-    try {
-      const result = await resetPasswordWithToken(db, {
-        token,
-        newPassword: new_password,
-      });
-
-      // Event für Auditing / Worker
-      try {
-        await streamAdd("auth-events", {
-          type: "password_reset_completed",
-          sub: result.user.id,
-        }, tenantId);
-      } catch (err) {
-        app.log.warn({ err }, "password_reset_stream_failed");
-      }
-
-      return reply.code(200).send({
-        ok: true,
-        user: {
-          id: result.user.id,
-          email: result.user.email,
-        },
-      });
-    } catch (err: any) {
-      if (err instanceof InvalidPasswordResetTokenError) {
-        app.log.warn("password_reset_invalid_token");
+      if (!parsed.success) {
+        const errorDetails = parsed.error.flatten();
         return reply.code(400).send({
           error: {
-            code: "PASSWORD_RESET_INVALID_TOKEN",
-            message: "Das Reset-Token ist ungültig.",
+            code: "PASSWORD_RESET_VALIDATION_FAILED",
+            message: "Ungültige Eingabe für Passwort-Reset.",
+            details: errorDetails,
           },
           statusCode: 400,
         });
       }
 
-      if (err instanceof ExpiredPasswordResetTokenError) {
-        app.log.info("password_reset_expired_token");
-        return reply.code(410).send({
+      const { token, new_password } = parsed.data;
+      const db = (req as any).db as DbClient | undefined;
+      const tenantId = (req as any).requestedTenantId as string | undefined;
+
+      if (!db) {
+        app.log.error("password_reset_missing_db_client");
+        return reply.code(500).send({
           error: {
-            code: "PASSWORD_RESET_TOKEN_EXPIRED",
-            message: "Das Reset-Token ist abgelaufen.",
+            code: "INTERNAL_DB_CONTEXT_MISSING",
+            message: "Database context not available for this request.",
           },
-          statusCode: 410,
+          statusCode: 500,
         });
       }
 
-      throw err;
-    }
+      if (!tenantId) {
+        app.log.error("password_reset_missing_tenant");
+        return reply.code(400).send({
+          error: {
+            code: "TENANT_REQUIRED",
+            message: "Tenant context is required.",
+          },
+          statusCode: 400,
+        });
+      }
+
+      let redisLock: RedisLockHandle | undefined;
+      try {
+        const lock = await acquireShortLock({
+          tenantId,
+          scope: "pwreset_confirm",
+          resource: sha256(token),
+          ttlMs: PASSWORD_RESET_CONFIRM_LOCK_TTL_MS,
+        });
+
+        if (!lock.acquired || !lock.lock) {
+          return reply.code(409).send({
+            error: {
+              code: "PASSWORD_RESET_IN_PROGRESS",
+              message: "Password reset already in progress.",
+            },
+            statusCode: 409,
+          });
+        }
+        redisLock = lock.lock;
+      } catch (err) {
+        app.log.warn({ err }, "password_reset_lock_acquire_failed");
+        return reply.code(503).send({
+          error: {
+            code: "LOCK_UNAVAILABLE",
+            message: "Temporary lock service unavailable.",
+          },
+          statusCode: 503,
+        });
+      }
+
+      try {
+        const result = await resetPasswordWithToken(db, {
+          token,
+          newPassword: new_password,
+        });
+
+        // Event für Auditing / Worker
+        try {
+          await streamAdd(
+            "auth-events",
+            {
+              type: "password_reset_completed",
+              sub: result.user.id,
+            },
+            tenantId,
+          );
+        } catch (err) {
+          app.log.warn({ err }, "password_reset_stream_failed");
+        }
+
+        return reply.code(200).send({
+          ok: true,
+          user: {
+            id: result.user.id,
+            email: result.user.email,
+          },
+        });
+      } catch (err: any) {
+        if (err instanceof InvalidPasswordResetTokenError) {
+          app.log.warn("password_reset_invalid_token");
+          return reply.code(400).send({
+            error: {
+              code: "PASSWORD_RESET_INVALID_TOKEN",
+              message: "Das Reset-Token ist ungültig.",
+            },
+            statusCode: 400,
+          });
+        }
+
+        if (err instanceof ExpiredPasswordResetTokenError) {
+          app.log.info("password_reset_expired_token");
+          return reply.code(410).send({
+            error: {
+              code: "PASSWORD_RESET_TOKEN_EXPIRED",
+              message: "Das Reset-Token ist abgelaufen.",
+            },
+            statusCode: 410,
+          });
+        }
+
+        throw err;
+      } finally {
+        if (redisLock) {
+          try {
+            await releaseShortLock(redisLock);
+          } catch (err) {
+            app.log.warn({ err }, "password_reset_lock_release_failed");
+          }
+        }
+      }
     },
   );
 

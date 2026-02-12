@@ -69,10 +69,23 @@ export interface AccessTokenPayload extends JWTPayload {
   typ: "access";
   tenant_id: string;    // UUID (cryptographically bound tenant)
   tid?: string;         // optionaler Alias
+  sid?: string;         // Session / Refresh family id
+  ver?: number;         // Claim schema version
+  role?: string;
+  roles?: string[];
+  plan?: string;
   permissions?: string[];
   perms?: string[];
   scope?: string;
 }
+
+type AccessTokenExtraClaims = {
+  sid?: string;
+  ver?: number;
+  role?: string;
+  roles?: string[];
+  plan?: string;
+};
 
 // ---------------------------------------------------------------------------
 // Access-Token signieren
@@ -86,10 +99,15 @@ export async function signAccessToken(
   sub: string,
   tenantId: string,
   ttlSec: number = DEFAULT_ACCESS_TTL_SEC,
+  extraClaims: AccessTokenExtraClaims = {},
 ): Promise<{ token: string; jti: string; exp: number }> {
   // Defensive Validation (fail fast, sauberer Fehler)
   if (!sub || typeof sub !== "string") throw new Error("sub_missing");
   assertUuid(tenantId, "tenant_id");
+
+  if (extraClaims.sid) {
+    assertUuid(extraClaims.sid, "sid");
+  }
 
   const jti = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
@@ -100,6 +118,11 @@ export async function signAccessToken(
     typ: "access",
     tenant_id: tenantId,
     tid: tenantId,
+    ver: typeof extraClaims.ver === "number" ? extraClaims.ver : 1,
+    ...(extraClaims.sid ? { sid: extraClaims.sid } : {}),
+    ...(extraClaims.role ? { role: extraClaims.role } : {}),
+    ...(Array.isArray(extraClaims.roles) ? { roles: extraClaims.roles } : {}),
+    ...(extraClaims.plan ? { plan: extraClaims.plan } : {}),
     ...(JWT_DEFAULT_SCOPE ? { scope: JWT_DEFAULT_SCOPE } : {}),
   })
     .setProtectedHeader({
@@ -158,6 +181,20 @@ export async function verifyAccessToken(token: string): Promise<AccessTokenPaylo
   assertUuid(tokenTenant, "tenant_id");
   (payload as any).tenant_id = tokenTenant;
   (payload as any).tid = tokenTenant;
+
+  const tokenSid = (payload as any).sid;
+  if (tokenSid !== undefined) {
+    assertUuid(tokenSid, "sid");
+  }
+
+  const tokenVer = (payload as any).ver;
+  if (tokenVer !== undefined) {
+    if (typeof tokenVer !== "number" || tokenVer < 1) {
+      throw new Error("ver_invalid");
+    }
+  } else {
+    (payload as any).ver = 1;
+  }
 
   // Jetzt ist payload sicher als AccessTokenPayload verwendbar
   return payload as AccessTokenPayload;

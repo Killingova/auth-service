@@ -1,6 +1,8 @@
 SHELL := /bin/bash
 COMPOSE ?= docker compose
 TEST_COMPOSE ?= docker compose -f docker-compose.test.yml
+EDGE_NETWORK ?= paradox_net
+BACKPLANE_NETWORK ?= paradox_backplane
 
 E2E_DB_HOST ?= 127.0.0.1
 E2E_DB_PORT ?= 55433
@@ -17,16 +19,33 @@ SVC_PROD := auth-service
 SVC_DEV  := auth-service
 
 .PHONY: prod-up prod-down prod-recreate prod-build prod-ps prod-logs prod-health prod-cid \
-	dev-up dev-down dev-recreate dev-build dev-ps dev-logs \
+	dev-up dev-down dev-recreate dev-build dev-ps dev-logs network-ensure \
 	ps logs env-show clean-orphans lint typecheck test test-unit test-e2e e2e-up e2e-down e2e-reset e2e-wait housekeeping secret-scan check gold
 
-prod-up:
+network-ensure:
+	@if ! docker network inspect $(EDGE_NETWORK) >/dev/null 2>&1; then \
+		echo "[INFO] creating docker network $(EDGE_NETWORK)"; \
+		docker network create $(EDGE_NETWORK); \
+	fi
+	@if ! docker network inspect $(BACKPLANE_NETWORK) >/dev/null 2>&1; then \
+		echo "[INFO] creating docker network $(BACKPLANE_NETWORK) as internal"; \
+		docker network create --internal $(BACKPLANE_NETWORK); \
+	fi
+	@internal="$$(docker network inspect $(BACKPLANE_NETWORK) --format '{{.Internal}}')"; \
+	if [ "$$internal" != "true" ]; then \
+		echo "[ERROR] network $(BACKPLANE_NETWORK) exists but is not internal=true" >&2; \
+		echo "        recreate manually: docker network rm $(BACKPLANE_NETWORK) && docker network create --internal $(BACKPLANE_NETWORK)" >&2; \
+		exit 1; \
+	fi
+	@echo "[OK] network $(EDGE_NETWORK) present; $(BACKPLANE_NETWORK)=internal"
+
+prod-up: network-ensure
 	$(COMPOSE) up -d --build
 
 prod-down:
 	$(COMPOSE) down --remove-orphans
 
-prod-recreate:
+prod-recreate: network-ensure
 	$(COMPOSE) up -d --force-recreate
 
 prod-build:
@@ -47,13 +66,13 @@ prod-health:
 	echo "CID=$$CID"; \
 	docker exec -it "$$CID" sh -lc 'for p in /healthz /readyz /health/redis /health/db /health; do echo "== $$p =="; wget -qO- -S "http://127.0.0.1:3000$$p" 2>&1 | head -n 60 || true; echo; done'
 
-dev-up:
+dev-up: network-ensure
 	$(COMPOSE) up -d
 
 dev-down:
 	$(COMPOSE) down --remove-orphans
 
-dev-recreate:
+dev-recreate: network-ensure
 	$(COMPOSE) up -d --force-recreate
 
 dev-build:

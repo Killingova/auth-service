@@ -24,7 +24,9 @@ import { signAccessToken } from "../../libs/jwt.js";
 
 import {
   deleteRefreshTokenById,
+  ensureUserHasMembership,
   findRefreshTokenByHash,
+  findUserAuthContextById,
   findUserByEmail,
   createSession,
   createRefreshTokenRecord,
@@ -77,8 +79,17 @@ export async function loginWithEmailPassword(
     throw new Error("invalid_credentials");
   }
 
+  const roles = await ensureUserHasMembership(db, {
+    tenantId: user.tenant_id,
+    userId: user.id,
+  });
+  const primaryRole = roles.role;
+  const plan = roles.plan || user.plan_code || "free";
+  const sessionId = randomUUID();
+
   // Session (Audit/Monitoring). TTL ist hier an ACCESS gekoppelt – ok als Default.
   await createSession(db, {
+    sessionId,
     tenantId: user.tenant_id,
     userId: user.id,
     ttlSec: ACCESS_TTL_SEC,
@@ -89,6 +100,13 @@ export async function loginWithEmailPassword(
     user.id,
     user.tenant_id,
     ACCESS_TTL_SEC,
+    {
+      sid: sessionId,
+      ver: 1,
+      role: primaryRole,
+      roles: roles.roles,
+      plan,
+    },
   );
 
   // Refresh Token: opaques Token (UUID) in DB gespeichert (Rotation über DB Record)
@@ -99,6 +117,7 @@ export async function loginWithEmailPassword(
     userId: user.id,
     tokenHash: refreshTokenHash,
     ttlSec: REFRESH_TTL_SEC,
+    familyId: sessionId,
   });
 
   const nowSec = Math.floor(Date.now() / 1000);
@@ -109,7 +128,11 @@ export async function loginWithEmailPassword(
       id: user.id,
       email: user.email,
       tenantId: user.tenant_id,
+      role: primaryRole,
+      roles: roles.roles,
+      plan,
     },
+    sessionId,
     accessToken,
     accessTokenExpiresAt: accessExp,
     refreshToken,
@@ -144,6 +167,10 @@ export async function refreshWithToken(
 
   const userId = stored.user_id;
   const tenantId = stored.tenant_id;
+  const authContext = await findUserAuthContextById(db, { tenantId, userId });
+  const roles = authContext?.role_names?.length ? authContext.role_names : ["member"];
+  const primaryRole = roles[0] ?? "member";
+  const plan = authContext?.plan_code ?? "free";
 
   // Neues Refresh-Token erzeugen (gleiche Family für Replay-Defense-Workflows)
   const newRefreshToken = randomUUID();
@@ -172,6 +199,13 @@ export async function refreshWithToken(
     userId,
     tenantId,
     ACCESS_TTL_SEC,
+    {
+      sid: stored.family_id,
+      ver: 1,
+      role: primaryRole,
+      roles,
+      plan,
+    },
   );
 
   const nowSec = Math.floor(Date.now() / 1000);

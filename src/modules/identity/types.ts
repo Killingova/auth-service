@@ -25,6 +25,8 @@ export interface UserRow {
   verified_at: string | null;
   created_at: string;
   updated_at: string;
+  plan_code: string | null;
+  role_names: string[];
 }
 
 export interface SessionRow {
@@ -69,7 +71,11 @@ export interface LoginResult {
     id: string;
     email: string;
     tenantId: string; // CamelCase-Variante von tenant_id (API-freundlich)
+    role: string;
+    roles: string[];
+    plan: string;
   };
+  sessionId: string;
   accessToken: string;
   accessTokenExpiresAt: number;   // Unix-Sekunden (exp aus JWT)
   refreshToken: string;           // opaques Secret (UUID/JTI)
