@@ -105,7 +105,6 @@ const EnvSchema = z.object({
   REDIS_USERNAME: z.string().optional(),
   REDIS_PASSWORD: z.string().optional(),
   REDIS_PASSWORD_FILE: z.string().optional(),
-  REDIS_NAMESPACE: z.string().default("paradox"),
 
   // --------------------------------------------------------------------------
   // PostgreSQL (Auth-Service)
@@ -335,7 +334,6 @@ export function logEnvSummary(
 
     // Redis
     REDIS_URL: mask(env.REDIS_URL),
-    REDIS_NAMESPACE: env.REDIS_NAMESPACE,
 
     // DB
     DATABASE_URL: mask(env.DATABASE_URL),

@@ -97,7 +97,6 @@ services:
       REDIS_HOST: "redis"
       REDIS_PORT: "6379"
       REDIS_USERNAME: "svc"
-      REDIS_NAMESPACE: "paradox"
 
       # JWT Claims (müssen zu Consumers passen)
       JWT_ISSUER: "auth-service"

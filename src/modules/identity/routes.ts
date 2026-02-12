@@ -105,12 +105,14 @@ export default async function identityRoutes(app: FastifyInstance) {
       const { email, password } = parsed.data;
       const emailHash = hashEmailForLog(email);
       const ipHash = hashIpForLog(req.ip || "unknown");
+      const tenantId = (req as any).requestedTenantId as string | undefined;
 
       try {
         const lockState = await getLoginFailureState(
           emailHash,
           ipHash,
           env.LOGIN_SOFT_LOCK_MAX_ATTEMPTS,
+          tenantId,
         );
         if (lockState.locked) {
           recordAuthLogin(false);
@@ -134,7 +136,7 @@ export default async function identityRoutes(app: FastifyInstance) {
         });
 
         try {
-          await clearLoginFailures(emailHash, ipHash);
+          await clearLoginFailures(emailHash, ipHash, tenantId);
         } catch (err) {
           app.log.warn({ err }, "login_soft_lock_clear_failed");
         }
@@ -146,13 +148,14 @@ export default async function identityRoutes(app: FastifyInstance) {
           `cache:user:${result.user.id}`,
           { id: result.user.id, email: result.user.email },
           300,
+          tenantId,
         );
 
         try {
           await streamAdd("auth-events", {
             type: "auth.login_success",
             sub: result.user.id,
-          });
+          }, tenantId);
         } catch (streamErr) {
           app.log.warn({ err: streamErr }, "login_success_stream_failed");
         }
@@ -176,13 +179,14 @@ export default async function identityRoutes(app: FastifyInstance) {
             ipHash,
             env.LOGIN_SOFT_LOCK_WINDOW_SEC,
             env.LOGIN_SOFT_LOCK_MAX_ATTEMPTS,
+            tenantId,
           );
           await streamAdd("auth-events", {
             type: "auth.login_failed",
             email_hash: emailHash,
             ip_hash: ipHash,
             attempts: state.count,
-          });
+          }, tenantId);
         } catch (lockErr) {
           app.log.warn({ err: lockErr }, "login_soft_lock_increment_failed");
         }
@@ -217,6 +221,7 @@ export default async function identityRoutes(app: FastifyInstance) {
 
       const db = requireDb(app, req, reply);
       if (!db) return;
+      const tenantId = (req as any).requestedTenantId as string | undefined;
 
       try {
         const result = await refreshWithToken(db, {
@@ -229,7 +234,7 @@ export default async function identityRoutes(app: FastifyInstance) {
         try {
           await streamAdd("auth-events", {
             type: "auth.refresh_success",
-          });
+          }, tenantId);
         } catch (streamErr) {
           app.log.warn({ err: streamErr }, "refresh_success_stream_failed");
         }
@@ -246,8 +251,8 @@ export default async function identityRoutes(app: FastifyInstance) {
         if (err instanceof RefreshReuseDetectedError) {
           recordAuthRefreshReuseDetected();
           try {
-            await streamAdd("auth-events", { type: "auth.refresh_reuse_detected" });
-            await streamAdd("auth-events", { type: "auth.refresh_family_revoked" });
+            await streamAdd("auth-events", { type: "auth.refresh_reuse_detected" }, tenantId);
+            await streamAdd("auth-events", { type: "auth.refresh_family_revoked" }, tenantId);
           } catch (streamErr) {
             app.log.warn({ err: streamErr }, "refresh_reuse_stream_failed");
           }
@@ -287,12 +292,13 @@ export default async function identityRoutes(app: FastifyInstance) {
 
       const jti = String(user.jti);
 
-      if (await blacklistHas(jti)) {
+      if (await blacklistHas(jti, String(user.tenant_id))) {
         return sendApiError(reply, 401, "TOKEN_REVOKED", "Token has been revoked.");
       }
 
       const cached = await getJSON<{ id: string; email: string }>(
         `cache:user:${user.sub}`,
+        String(user.tenant_id),
       );
 
       return reply.send({
@@ -324,12 +330,12 @@ export default async function identityRoutes(app: FastifyInstance) {
       const now = Math.floor(Date.now() / 1000);
       const ttl = Math.max(1, exp - now);
 
-      await blacklistAdd(String(user.jti), ttl);
+      await blacklistAdd(String(user.jti), ttl, String(user.tenant_id));
       try {
         await streamAdd("auth-events", {
           type: "auth.logout",
           sub: String(user.sub),
-        });
+        }, String(user.tenant_id));
       } catch (streamErr) {
         app.log.warn({ err: streamErr }, "logout_stream_failed");
       }

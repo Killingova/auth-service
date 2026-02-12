@@ -1,5 +1,6 @@
 // src/plugins/rate-limit.ts
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
+import fp from "fastify-plugin";
 import { incrLimit } from "../libs/redis.js";
 import { apiError } from "../libs/error-response.js";
 
@@ -32,6 +33,9 @@ const SKIP = new Set<string>([
   "/openapi.json",
 ]);
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 /** In onRequest ist die Route noch nicht "resolved".
  *  Deshalb robust: rohe URL nehmen, Query abtrennen, Normalisierung.
  */
@@ -43,11 +47,24 @@ function getStablePath(req: FastifyRequest): string {
 }
 
 /** Schlüsselelement für Rate-Limit-Bucket */
-function bucketKey(req: FastifyRequest): { route: string; ip: string } {
+function readTenantId(req: FastifyRequest): string | undefined {
+  const raw = req.headers["x-tenant-id"];
+  const value =
+    typeof raw === "string"
+      ? raw.trim()
+      : Array.isArray(raw) && typeof raw[0] === "string"
+        ? raw[0].trim()
+        : "";
+
+  if (!value || !UUID_RE.test(value)) return undefined;
+  return value.toLowerCase();
+}
+
+function bucketKey(req: FastifyRequest): { route: string; ip: string; tenantId?: string } {
   const route = getStablePath(req);
   // IP: bei Proxy-Setups ist trustProxy=true in app.ts bereits gesetzt
   const ip = req.ip;
-  return { route, ip };
+  return { route, ip, tenantId: readTenantId(req) };
 }
 
 declare module "fastify" {
@@ -58,15 +75,16 @@ declare module "fastify" {
 
 const rateLimitPlugin: FastifyPluginAsync = async (app) => {
   app.addHook("onRequest", async (request: FastifyRequest, reply: FastifyReply) => {
-    const { route, ip } = bucketKey(request);
+    const { route, ip, tenantId } = bucketKey(request);
     if (SKIP.has(route)) return;
+    if (!tenantId) return;
     const maxForRoute = SENSITIVE_ROUTES.has(route) ? SENSITIVE_MAX : MAX;
 
     let count = 0, ttl = 0, blocked = false;
 
     try {
       // incrLimit(route, ip, windowSec, max)
-      const res = await incrLimit(route, ip, WINDOW, maxForRoute);
+      const res = await incrLimit(route, ip, WINDOW, maxForRoute, tenantId);
       count   = res.count;
       ttl     = res.ttl;
       blocked = res.blocked;
@@ -108,4 +126,4 @@ const rateLimitPlugin: FastifyPluginAsync = async (app) => {
   });
 };
 
-export default rateLimitPlugin;
+export default fp(rateLimitPlugin, { name: "rate-limit" });

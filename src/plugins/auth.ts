@@ -77,7 +77,14 @@ const authPlugin: FastifyPluginAsync = async (app) => {
 
       // req.user wird von tenant-guard.ts und Routes genutzt
       // (Type Augmentation sollte das in types/fastify.d.ts deklarieren)
-      if (await blacklistHas(String(payload.jti))) {
+      const tenantId =
+        typeof (req as any).requestedTenantId === "string"
+          ? (req as any).requestedTenantId
+          : typeof payload.tenant_id === "string"
+            ? payload.tenant_id
+            : undefined;
+
+      if (await blacklistHas(String(payload.jti), tenantId)) {
         reply.header("WWW-Authenticate", 'Bearer error="invalid_token"');
         return sendApiError(reply, 401, "TOKEN_REVOKED", "Token has been revoked.");
       }

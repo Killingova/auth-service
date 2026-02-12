@@ -117,7 +117,7 @@ export default async function internalRoutes(app: FastifyInstance) {
     try {
       const payload = await verifyAccessToken(token);
 
-      if (await blacklistHas(String(payload.jti))) {
+      if (await blacklistHas(String(payload.jti), headerTenant)) {
         return reply.code(401).send({ status: 401, message: "Unauthorized" });
       }
 

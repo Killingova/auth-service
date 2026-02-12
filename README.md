@@ -3,6 +3,12 @@ Auth-Service (Fastify, PostgreSQL, Redis)
 
 Dieser Dienst stellt einen mandantenfähigen Auth‑Service bereit: Login, Registrierung, E‑Mail‑Verifikation, Passwort‑Reset, Magic‑Link, OTP, Sessions, Tenants und Token‑Cleanup. Er ist auf Fastify v5 aufgebaut und nutzt PostgreSQL (auth‑Schema) und Redis.
 
+## Aktueller Stand (2026-02-12 14:37:47 CET)
+
+- Container `auth-service-stack-auth-service-1` laeuft `healthy`.
+- Gateway-Check `https://127.0.0.1:8443/auth/healthz` liefert `200`.
+- Redis-Key-Schema ist tenant-basiert (`tenant:{tenantId}:auth:*`), Legacy-Namespace ist entfernt.
+
 Die wichtigsten Bausteine:
 
 - `src/app.ts` – Fastify‑App (`buildApp`), Health‑Routen, Modul‑Registrierung.

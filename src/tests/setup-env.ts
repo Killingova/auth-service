@@ -13,4 +13,3 @@ process.env.REDIS_HOST ||= "127.0.0.1";
 process.env.REDIS_PORT ||= "6379";
 process.env.REDIS_USERNAME ||= "default";
 process.env.REDIS_PASSWORD ||= "test";
-process.env.REDIS_NAMESPACE ||= "auth-test";

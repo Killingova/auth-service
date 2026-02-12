@@ -166,7 +166,7 @@ export default async function magicLinkRoutes(app: FastifyInstance) {
             type: "magic_link_requested",
             email_hash: hashEmailForLog(email),
             status: result.requestAccepted ? "accepted" : "ignored",
-          });
+          }, tenantId);
         } catch (err) {
           app.log.warn({ err }, "magic_link_request_stream_failed");
       }
@@ -215,6 +215,7 @@ export default async function magicLinkRoutes(app: FastifyInstance) {
 
       const { token } = parsed.data;
       const db = (req as any).db as DbClient;
+      const tenantId = (req as any).requestedTenantId as string | undefined;
 
       try {
         const result = await consumeMagicLink(db, {
@@ -227,7 +228,7 @@ export default async function magicLinkRoutes(app: FastifyInstance) {
           await streamAdd("auth-events", {
             type: "magic_link_consumed",
             sub: result.user.id,
-          });
+          }, tenantId);
         } catch (err) {
           app.log.warn({ err }, "magic_link_consume_stream_failed");
         }

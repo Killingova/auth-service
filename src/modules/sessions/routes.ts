@@ -75,7 +75,7 @@ async function getAuthenticatedUserId(
   const payload: AccessTokenPayload = await verifyAccessToken(token);
   const jti = String(payload.jti);
 
-  if (await blacklistHas(jti)) {
+  if (await blacklistHas(jti, String(payload.tenant_id))) {
     const err: any = new Error("Token ist nicht mehr gültig.");
     err.statusCode = 401;
     err.code = "TOKEN_REVOKED";

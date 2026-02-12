@@ -171,7 +171,7 @@ export default async function passwordRoutes(app: FastifyInstance) {
           type: "password_reset_requested",
           email_hash: hashEmailForLog(email),
           status: result.requestAccepted ? "accepted" : "ignored",
-        });
+        }, tenantId);
       } catch (err) {
         app.log.warn({ err }, "password_forgot_stream_failed");
       }
@@ -227,6 +227,7 @@ export default async function passwordRoutes(app: FastifyInstance) {
 
     const { token, new_password } = parsed.data;
     const db = (req as any).db as DbClient | undefined;
+    const tenantId = (req as any).requestedTenantId as string | undefined;
 
     if (!db) {
       app.log.error("password_reset_missing_db_client");
@@ -250,7 +251,7 @@ export default async function passwordRoutes(app: FastifyInstance) {
         await streamAdd("auth-events", {
           type: "password_reset_completed",
           sub: result.user.id,
-        });
+        }, tenantId);
       } catch (err) {
         app.log.warn({ err }, "password_reset_stream_failed");
       }
@@ -357,7 +358,7 @@ export default async function passwordRoutes(app: FastifyInstance) {
         await streamAdd("auth-events", {
           type: "password_changed",
           sub: String(payload.sub),
-        });
+        }, String(payload.tenant_id));
       } catch (err) {
         app.log.warn({ err }, "password_change_stream_failed");
       }

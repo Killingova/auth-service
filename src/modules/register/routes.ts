@@ -96,6 +96,7 @@ export default async function registerRoutes(app: FastifyInstance) {
     //   ausgeführt wurden.
     // - Wir casten hier leicht, damit TypeScript weiß, dass db existiert.
     const { db } = req as typeof req & { db: DbClient };
+    const tenantId = (req as any).requestedTenantId as string | undefined;
 
     try {
       // 3) Business-Logik (Service-Layer)
@@ -121,7 +122,7 @@ export default async function registerRoutes(app: FastifyInstance) {
         await streamAdd("auth-events", {
           type: "user_registered",
           sub: result.user.id,
-        });
+        }, tenantId);
       } catch (err) {
         app.log.warn({ err }, "register_stream_failed");
       }
