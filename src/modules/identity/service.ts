@@ -5,15 +5,14 @@
 // Verantwortlichkeiten:
 // - Login mit E-Mail/Passwort
 // - Refresh über opaques Refresh-Token (Rotation)
-// - JWT Access Token enthält tenant_id (Pflicht-Claim)
-// - Tenant-Kontext ist cryptographically bound: Header vs JWT wird im tenant-guard
-//   geprüft; DB setzt app.tenant ausschließlich aus verified JWT tenant_id.
+// - JWT Access Token ist identity-first:
+//   * tenant_id ist optional (global user Modell)
+//   * Tenant-Zugehörigkeit wird bei Bedarf via Membership geprüft (Gateway/internal verify)
 //
 // WICHTIG (RLS):
 // - Alle DB-Operationen laufen über den pro-Request DbClient (PoolClient),
 //   der durch tenant-db-context.ts vorbereitet wurde:
 //     BEGIN;
-//     SELECT set_config('app.tenant', '<UUID>', true);
 //     SET LOCAL ROLE app_auth;
 // ============================================================================
 
@@ -24,13 +23,12 @@ import { signAccessToken } from "../../libs/jwt.js";
 
 import {
   deleteRefreshTokenById,
-  ensureUserHasMembership,
+  findLoginCandidateByEmail,
   findRefreshTokenByHash,
-  findUserAuthContextById,
-  findUserByEmail,
   createSession,
   createRefreshTokenRecord,
   markRefreshTokenRotated,
+  resolveUserAuthContext,
   revokeRefreshFamily,
 } from "./repository.js";
 
@@ -53,6 +51,13 @@ export class RefreshFailedError extends Error {
   }
 }
 
+export class LoginFailedError extends Error {
+  constructor() {
+    super("invalid_credentials");
+    this.name = "LoginFailedError";
+  }
+}
+
 export class RefreshReuseDetectedError extends Error {
   constructor() {
     super("refresh_reuse_detected");
@@ -68,43 +73,46 @@ export async function loginWithEmailPassword(
   db: DbClient,
   params: LoginInput,
 ): Promise<LoginResult> {
-  const user = await findUserByEmail(db, params.email);
+  const user = await findLoginCandidateByEmail(db, {
+    email: params.email,
+    requestedTenantId: params.requestedTenantId,
+  });
 
   // Timing-Hardening: auch bei unbekanntem User wird eine Verifikation ausgefuehrt.
   const passwordHash = user?.password_hash ?? DUMMY_PASSWORD_HASH;
   const ok = await verifyPassword(passwordHash, params.password);
 
   // bewusst generisch: keine Info, ob User existiert / aktiv ist
-  if (!user || !user.is_active || !ok) {
-    throw new Error("invalid_credentials");
+  if (!user || !user.is_active || !user.verified_at || !ok) {
+    throw new LoginFailedError();
   }
 
-  const roles = await ensureUserHasMembership(db, {
-    tenantId: user.tenant_id,
+  const ctx = await resolveUserAuthContext(db, {
     userId: user.id,
+    requestedTenantId: params.requestedTenantId,
   });
-  const primaryRole = roles.role;
-  const plan = roles.plan || user.plan_code || "free";
+  const primaryRole = ctx.role;
+  const plan = ctx.plan || "free";
+  const tenantId = ctx.tenantId;
   const sessionId = randomUUID();
 
   // Session (Audit/Monitoring). TTL ist hier an ACCESS gekoppelt – ok als Default.
   await createSession(db, {
     sessionId,
-    tenantId: user.tenant_id,
     userId: user.id,
     ttlSec: ACCESS_TTL_SEC,
   });
 
-  // JWT Access Token: tenant_id ist Pflicht-Claim (cryptographically bound)
+  // JWT Access Token: tenant_id optional (global identity)
   const { token: accessToken, exp: accessExp } = await signAccessToken(
     user.id,
-    user.tenant_id,
+    tenantId,
     ACCESS_TTL_SEC,
     {
       sid: sessionId,
       ver: 1,
       role: primaryRole,
-      roles: roles.roles,
+      roles: ctx.roles,
       plan,
     },
   );
@@ -113,7 +121,6 @@ export async function loginWithEmailPassword(
   const refreshToken = randomUUID();
   const refreshTokenHash = hashOpaqueToken(refreshToken);
   await createRefreshTokenRecord(db, {
-    tenantId: user.tenant_id,
     userId: user.id,
     tokenHash: refreshTokenHash,
     ttlSec: REFRESH_TTL_SEC,
@@ -127,9 +134,9 @@ export async function loginWithEmailPassword(
     user: {
       id: user.id,
       email: user.email,
-      tenantId: user.tenant_id,
+      ...(tenantId ? { tenantId } : {}),
       role: primaryRole,
-      roles: roles.roles,
+      roles: ctx.roles,
       plan,
     },
     sessionId,
@@ -166,17 +173,19 @@ export async function refreshWithToken(
   }
 
   const userId = stored.user_id;
-  const tenantId = stored.tenant_id;
-  const authContext = await findUserAuthContextById(db, { tenantId, userId });
-  const roles = authContext?.role_names?.length ? authContext.role_names : ["member"];
-  const primaryRole = roles[0] ?? "member";
-  const plan = authContext?.plan_code ?? "free";
+  const ctx = await resolveUserAuthContext(db, {
+    userId,
+    requestedTenantId: params.requestedTenantId,
+  });
+  const tenantId = ctx.tenantId;
+  const roles = ctx.roles?.length ? ctx.roles : ["member"];
+  const primaryRole = ctx.role || roles[0] || "member";
+  const plan = ctx.plan || "free";
 
   // Neues Refresh-Token erzeugen (gleiche Family für Replay-Defense-Workflows)
   const newRefreshToken = randomUUID();
   const newRefreshTokenHash = hashOpaqueToken(newRefreshToken);
   const rotated = await createRefreshTokenRecord(db, {
-    tenantId,
     userId,
     tokenHash: newRefreshTokenHash,
     ttlSec: REFRESH_TTL_SEC,

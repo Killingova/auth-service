@@ -13,9 +13,11 @@ import { randomUUID } from "node:crypto";
 import { hashPassword } from "../../libs/crypto.js";
 import { dbHealth } from "../../libs/db.js";
 import type { DbClient } from "../../libs/db.js";
+import { transporter, SMTP_FROM } from "../../libs/mail.js";
 
 import {
   findUserByEmail,
+  findUserByEmailRow,
   insertUser,
   createEmailVerifyTokenRecord,
 } from "./repository.js";
@@ -31,24 +33,6 @@ import type {
  * TODO: später aus ENV holen (z. B. EMAIL_VERIFY_TTL_SEC).
  */
 const EMAIL_VERIFY_TTL_SEC = 60 * 60 * 24 * 3; // 3 Tage
-
-/**
- * Business-Fehler, wenn E-Mail bereits existiert.
- * Wird von der Route abgefangen und in eine datensparsame Antwort
- * (ohne konkrete Aussage "Account existiert bereits") übersetzt.
- */
-export class EmailAlreadyRegisteredError extends Error {
-  statusCode = 409;
-
-  constructor(email: string) {
-    super(`Email already registered: ${email}`);
-    this.name = "EmailAlreadyRegisteredError";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Registrierung
-// ---------------------------------------------------------------------------
 
 /**
  * Haupt-UseCase: neuen User registrieren.
@@ -78,30 +62,56 @@ export async function registerUser(
   const email = params.email.trim().toLowerCase();
   const password = params.password;
 
-  // 1) Prüfen, ob E-Mail schon vorhanden ist (RLS-sicher über db)
-  const existing = await findUserByEmail(db, email);
-  if (existing) {
-    // Business-Fehler: von Route abgefangen → generische Antwort, DSGVO-freundlich
-    throw new EmailAlreadyRegisteredError(email);
+  // Anti-enum: wir liefern immer "accepted" zurück, egal ob der User existiert.
+  // Trotzdem: wir versuchen best-effort ein Verify-Token zu erstellen (nur wenn sinnvoll).
+
+  // 1) Existiert User schon?
+  const existingRow = await findUserByEmailRow(db, email);
+  if (existingRow) {
+    if (!existingRow.verified_at) {
+      const verifyToken = randomUUID();
+      await createEmailVerifyTokenRecord({
+        client: db,
+        userId: existingRow.id,
+        token: verifyToken,
+        ttlSec: EMAIL_VERIFY_TTL_SEC,
+      });
+
+      // Best effort mail (DEV: Mailpit). Fehler darf Registrierung nicht brechen.
+      try {
+        const verifyUrl = `http://localhost:8080/verify?token=${verifyToken}`;
+        await transporter.sendMail({
+          from: SMTP_FROM,
+          to: email,
+          subject: "Verify your email",
+          text: `Please verify your email: ${verifyUrl}`,
+        });
+      } catch {
+        // ignore
+      }
+    }
+
+    return { requestAccepted: true };
   }
 
   // 2) Passwort hashen (Work-Factor/Algorithmus zentral in libs/crypto.ts)
   const passwordHash = await hashPassword(password);
 
-  // 3) User anlegen (aktuell über Default-Tenant in insertUser; später optional
-  //    tenantName aus params.tenantName nutzen, um Mandanten dynamisch anzulegen)
-  let user: Awaited<ReturnType<typeof insertUser>>;
-  try {
-    user = await insertUser(db, email, passwordHash);
-  } catch (err: any) {
-    // Race-condition-safe: unique(email per tenant) sauber als Business-Fehler mappen.
-    if (err?.code === "23505") {
-      throw new EmailAlreadyRegisteredError(email);
+  // 3) User anlegen (global identity)
+  let user = await insertUser(db, email, passwordHash).catch(async (err: any) => {
+    // Race-condition-safe: email UNIQUE.
+    if (err?.code !== "23505") {
+      throw err;
     }
-    throw err;
-  }
+    // Best effort: treat as existing.
+    const existing = await findUserByEmail(db, email);
+    if (!existing) {
+      throw err;
+    }
+    return existing;
+  });
 
-  // 4) E-Mail-Verifikations-Token erzeugen (auth.tokens, type = 'verify_email')
+  // 4) E-Mail-Verifikations-Token erzeugen (auth.tokens, type='verify_email')
   const verifyToken = randomUUID();
   await createEmailVerifyTokenRecord({
     client: db,
@@ -110,20 +120,20 @@ export async function registerUser(
     ttlSec: EMAIL_VERIFY_TTL_SEC,
   });
 
-  // TODO:
-  // - An dieser Stelle kannst du ein Mail-Module / Worker triggern, der eine
-  //   Verify-Mail verschickt (z. B. via Redis-Stream "auth-events").
-  // - verifyToken bleibt bewusst intern und wird NICHT an den Client gesendet.
+  // Best effort mail (DEV: Mailpit). Fehler darf Registrierung nicht brechen.
+  try {
+    const verifyUrl = `http://localhost:8080/verify?token=${verifyToken}`;
+    await transporter.sendMail({
+      from: SMTP_FROM,
+      to: email,
+      subject: "Verify your email",
+      text: `Please verify your email: ${verifyUrl}`,
+    });
+  } catch {
+    // ignore
+  }
 
-  const result: RegisterResult = {
-    user,
-    // emailVerification könnte hier optional mit zurückgegeben werden,
-    // falls du sie innerhalb des Backends weiterreichen willst
-    // (nicht an den HTTP-Client!).
-    // emailVerification,
-  };
-
-  return result;
+  return { requestAccepted: true };
 }
 
 // ---------------------------------------------------------------------------

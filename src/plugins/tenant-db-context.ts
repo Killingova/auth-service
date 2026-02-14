@@ -36,7 +36,7 @@ import { sendApiError } from "../libs/error-response.js";
 
 function needsDbTenantTx(req: any): boolean {
   const cfg = req.routeOptions?.config as any;
-  return cfg?.tenant === true || cfg?.auth === true;
+  return cfg?.tenant === true || cfg?.auth === true || cfg?.db === true;
 }
 
 function getTenantForDb(req: any): string | undefined {
@@ -115,10 +115,12 @@ const tenantDbContextPlugin: FastifyPluginAsync = async (app: FastifyInstance) =
     // Nur dort DB-TX öffnen, wo Tenant/Auth wirklich verlangt wird.
     if (!needsDbTenantTx(request)) return;
 
+    const cfg = request.routeOptions?.config as any;
     const tenantId = getTenantForDb(request);
     const userId = getUserIdForDb(request);
 
-    if (!tenantId) {
+    // tenant/auth-Routen bleiben strikt tenant-pflichtig.
+    if (!tenantId && cfg?.tenant === true) {
       return sendApiError(
         reply,
         400,
@@ -137,8 +139,10 @@ const tenantDbContextPlugin: FastifyPluginAsync = async (app: FastifyInstance) =
       await client.query("BEGIN");
       s.inTx = true;
 
-      // Tenant in GUC setzen (transaction-local)
-      await client.query("SELECT set_config('app.tenant', $1, true);", [tenantId]);
+      // Tenant in GUC setzen (transaction-local), falls vorhanden.
+      if (tenantId) {
+        await client.query("SELECT set_config('app.tenant', $1, true);", [tenantId]);
+      }
 
       // Optional: User in GUC setzen, wenn authentifiziert.
       if (userId) {

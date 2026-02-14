@@ -104,6 +104,17 @@ function scopedTenantKey(
   return tenantKey(requireTenantId(tenantId, op), ...parts);
 }
 
+function scopedKey(
+  tenantId: string | undefined,
+  ...parts: (string | number)[]
+): string {
+  const normalized = normalizeTenantId(tenantId);
+  if (normalized) {
+    return tenantKey(normalized, ...parts);
+  }
+  return ["global", SERVICE_NS, ...parts].join(":");
+}
+
 function splitLogicalKey(logicalKey: string): string[] {
   return logicalKey.split(":").filter(Boolean);
 }
@@ -128,7 +139,7 @@ export async function setJSON(
   tenantId?: string,
 ) {
   const payload = JSON.stringify(value);
-  const keyName = scopedTenantKey(tenantId, "setJSON", ...splitLogicalKey(logicalKey));
+  const keyName = scopedKey(tenantId, ...splitLogicalKey(logicalKey));
   const args: (string | number)[] = [keyName, payload];
   if (ttlSec && ttlSec > 0) args.push("EX", ttlSec);
   return (redis as any).set(...(args as any));
@@ -139,7 +150,7 @@ export async function getJSON<T = unknown>(
   tenantId?: string,
 ): Promise<T | null> {
   const parts = splitLogicalKey(logicalKey);
-  const primaryKey = scopedTenantKey(tenantId, "getJSON", ...parts);
+  const primaryKey = scopedKey(tenantId, ...parts);
   const raw = await redis.get(primaryKey);
   return raw ? (JSON.parse(raw) as T) : null;
 }
@@ -154,9 +165,8 @@ export async function incrLimit(
   max: number,
   tenantId?: string,
 ) {
-  const rateKey = scopedTenantKey(
+  const rateKey = scopedKey(
     tenantId,
-    "incrLimit",
     "rate",
     normalizedKeyPart(routeId),
     normalizedKeyPart(ip),
@@ -171,7 +181,7 @@ export async function incrLimit(
 // Login soft-lock (account + ip)
 // -----------------------------
 function loginLockKey(emailHash: string, ipHash: string, tenantId?: string) {
-  return scopedTenantKey(tenantId, "loginLock", "lock", "login", emailHash, ipHash);
+  return scopedKey(tenantId, "lock", "login", emailHash, ipHash);
 }
 
 export async function getLoginFailureState(
@@ -226,7 +236,7 @@ export async function clearLoginFailures(
 // -----------------------------
 export async function blacklistAdd(tokenJti: string, ttlSec: number, tenantId?: string) {
   return redis.set(
-    scopedTenantKey(tenantId, "blacklistAdd", "bl", "access", tokenJti),
+    scopedKey(tenantId, "bl", "access", tokenJti),
     "1",
     "EX",
     ttlSec,
@@ -235,7 +245,7 @@ export async function blacklistAdd(tokenJti: string, ttlSec: number, tenantId?: 
 
 export async function blacklistHas(tokenJti: string, tenantId?: string) {
   return (
-    (await redis.exists(scopedTenantKey(tenantId, "blacklistHas", "bl", "access", tokenJti))) ===
+    (await redis.exists(scopedKey(tenantId, "bl", "access", tokenJti))) ===
     1
   );
 }
@@ -253,9 +263,8 @@ function idempotencyCacheKey(
   endpoint: string,
   idempotencyKey: string,
 ) {
-  return scopedTenantKey(
+  return scopedKey(
     tenantId,
-    "idempotencyCacheKey",
     "idem",
     hashKeyPart(endpoint),
     hashKeyPart(idempotencyKey),
@@ -364,6 +373,6 @@ export async function streamAdd(
   const flat: (string | number)[] = [];
   for (const [k, v] of Object.entries(fields)) flat.push(k, String(v));
 
-  const streamKey = scopedTenantKey(tenantId, "streamAdd", "stream", stream);
+  const streamKey = scopedKey(tenantId, "stream", stream);
   return (redis as any).xadd(streamKey, "*", ...(flat as any));
 }

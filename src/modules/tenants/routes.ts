@@ -21,6 +21,7 @@ import {
   verifyAccessToken,
   type AccessTokenPayload,
 } from "../../libs/jwt.js";
+import { sendApiError } from "../../libs/error-response.js";
 
 import {
   getCurrentTenantForUser,
@@ -44,6 +45,13 @@ const TenantsListQuerySchema = z.object({
 });
 
 type TenantsListQuery = z.infer<typeof TenantsListQuerySchema>;
+
+const TenantBootstrapBodySchema = z.object({
+  name: z.string().min(3).max(120),
+  slug: z.string().min(3).max(64).optional(),
+});
+
+type TenantBootstrapBody = z.infer<typeof TenantBootstrapBodySchema>;
 
 // ---------------------------------------------------------------------------
 // Hilfsfunktion: Access-Token aus Header validieren
@@ -97,6 +105,84 @@ async function getAuthenticatedUserId(
 // ---------------------------------------------------------------------------
 
 export default async function tenantsRoutes(app: FastifyInstance) {
+  // -------------------------------------------------------------------------
+  // POST /auth/tenants/bootstrap
+  // -------------------------------------------------------------------------
+  //
+  // Global user Modell (Option 2):
+  // - Auth required
+  // - Tenant header ist NICHT erforderlich (Tenant wird hier erzeugt)
+  //
+  app.post<{ Body: TenantBootstrapBody }>(
+    "/bootstrap",
+    { config: { tenant: false, auth: true, db: true } },
+    async (req, reply) => {
+      const parsed = TenantBootstrapBodySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return sendApiError(
+          reply,
+          400,
+          "VALIDATION_FAILED",
+          "Invalid tenant bootstrap payload.",
+          parsed.error.flatten(),
+        );
+      }
+
+      const user = req.user as AccessTokenPayload | undefined;
+      if (!user) {
+        return sendApiError(reply, 401, "INVALID_TOKEN", "Missing auth context.");
+      }
+
+      const db = (req as any).db as DbClient | undefined;
+      if (!db) {
+        return sendApiError(reply, 500, "INTERNAL", "Database context not available.");
+      }
+
+      const { name, slug } = parsed.data;
+
+      const { rows } = await db.query<{
+        tenant_id: string;
+        tenant_name: string;
+        tenant_slug: string;
+        tenant_created_at: string;
+        role: string;
+        role_names: string[];
+        plan_code: string;
+      }>(
+        `
+          SELECT
+            tenant_id,
+            tenant_name,
+            tenant_slug,
+            tenant_created_at,
+            role,
+            role_names,
+            plan_code
+          FROM auth.tenants_bootstrap_for_user($1::uuid, $2::text, $3::text);
+        `,
+        [String(user.sub), name, slug ?? null],
+      );
+
+      const row = rows[0];
+      if (!row?.tenant_id) {
+        return sendApiError(reply, 500, "INTERNAL", "Tenant bootstrap failed.");
+      }
+
+      return reply.send({
+        tenantId: row.tenant_id,
+        tenant: {
+          id: row.tenant_id,
+          name: row.tenant_name,
+          createdAt: row.tenant_created_at,
+        },
+        role: row.role,
+        roles: row.role_names ?? [],
+        plan: row.plan_code,
+        message: "Tenant erfolgreich erstellt.",
+      });
+    },
+  );
+
   // -------------------------------------------------------------------------
   // GET /auth/tenants/me
   // -------------------------------------------------------------------------

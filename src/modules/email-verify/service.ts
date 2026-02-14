@@ -6,6 +6,7 @@
 import { randomUUID } from "node:crypto";
 import type { DbClient } from "../../libs/db.js";
 import { dbHealth } from "../../libs/db.js";
+import { SMTP_FROM, transporter } from "../../libs/mail.js";
 
 import {
   createEmailVerifyTokenRecord,
@@ -70,6 +71,19 @@ export async function requestEmailVerification(
     token,
     ttlSec: EMAIL_VERIFY_TTL_SEC,
   });
+
+  // Best effort mail (DEV: Mailpit). Fehler darf nicht leaken/brechen.
+  try {
+    const verifyUrl = `http://localhost:8080/verify?token=${token}`;
+    await transporter.sendMail({
+      from: SMTP_FROM,
+      to: email,
+      subject: "Verify your email",
+      text: `Please verify your email: ${verifyUrl}`,
+    });
+  } catch {
+    // ignore
+  }
 
   return { requestAccepted: true };
 }

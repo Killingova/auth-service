@@ -89,6 +89,81 @@ function collectRoles(payload: Record<string, unknown>): Set<string> {
   return roles;
 }
 
+async function resolveMembershipContext(
+  tenantId: string,
+  userId: string,
+): Promise<{ role: string; roles: string[]; plan: string } | null> {
+  let client: DbClient | undefined;
+
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    await client.query("SELECT set_config('app.tenant', $1, true);", [tenantId]);
+    await client.query("SELECT set_config('app.user_id', $1, true);", [userId]);
+    await client.query("SET LOCAL ROLE app_auth;");
+
+    // 1) membership roles (tenant-scoped via RLS)
+    const rolesRes = await client.query<{ name: string }>(
+      `
+        SELECT r.name
+        FROM auth.memberships m
+        JOIN auth.roles r
+          ON r.id = m.role_id
+         AND r.tenant_id = m.tenant_id
+        WHERE m.tenant_id = $1
+          AND m.user_id = $2
+        ORDER BY r.name ASC;
+      `,
+      [tenantId, userId],
+    );
+
+    if (!rolesRes.rowCount) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+
+    const roles = rolesRes.rows.map((row) => row.name);
+    const role = roles[0] ?? "member";
+
+    // 2) plan (tenant -> plan)
+    const planRes = await client.query<{ code: string | null }>(
+      `
+        SELECT p.code
+        FROM auth.tenants t
+        LEFT JOIN auth.plans p ON p.id = t.plan_id
+        WHERE t.id = $1
+        LIMIT 1;
+      `,
+      [tenantId],
+    );
+    const plan = planRes.rows[0]?.code ?? "free";
+
+    // Best effort: track last_active tenant for UX (non-critical).
+    try {
+      await client.query(
+        `
+          UPDATE auth.users
+          SET last_active_tenant_id = $1
+          WHERE id = $2;
+        `,
+        [tenantId, userId],
+      );
+    } catch {
+      // ignore
+    }
+
+    await client.query("COMMIT");
+    return { role, roles, plan };
+  } catch (err) {
+    if (client) {
+      try { await client.query("ROLLBACK"); } catch {}
+    }
+    throw err;
+  } finally {
+    client?.release();
+  }
+}
+
 export default async function internalRoutes(app: FastifyInstance) {
   // -------------------------------------------------------------------------
   // GET /internal/verify
@@ -106,10 +181,11 @@ export default async function internalRoutes(app: FastifyInstance) {
     }
 
     const headerTenantRaw = readHeaderValue(req.headers["x-tenant-id"]);
-    if (!headerTenantRaw || !UUID_RE.test(headerTenantRaw)) {
+    const headerTenant =
+      headerTenantRaw && UUID_RE.test(headerTenantRaw) ? headerTenantRaw.toLowerCase() : undefined;
+    if (headerTenantRaw && !headerTenant) {
       return reply.code(401).send({ status: 401, message: "Unauthorized" });
     }
-    const headerTenant = headerTenantRaw.toLowerCase();
 
     const requiredScope = readHeaderValue(req.headers["x-required-scope"]);
     const requiredRole = readHeaderValue(req.headers["x-required-role"]);
@@ -117,35 +193,44 @@ export default async function internalRoutes(app: FastifyInstance) {
     try {
       const payload = await verifyAccessToken(token);
 
-      if (await blacklistHas(String(payload.jti), headerTenant)) {
+      if (await blacklistHas(String(payload.jti))) {
         return reply.code(401).send({ status: 401, message: "Unauthorized" });
-      }
-
-      const tokenTenantRaw = String(payload.tenant_id ?? payload.tid ?? "");
-      if (!UUID_RE.test(tokenTenantRaw)) {
-        return reply.code(401).send({ status: 401, message: "Unauthorized" });
-      }
-      const tokenTenant = tokenTenantRaw.toLowerCase();
-
-      if (tokenTenant !== headerTenant) {
-        return reply.code(403).send({ status: 403, message: "Forbidden" });
       }
 
       const claimsObject = payload as unknown as Record<string, unknown>;
       const scopes = collectScopes(claimsObject);
-      const roles = collectRoles(claimsObject);
+      const tokenRoles = collectRoles(claimsObject);
 
       if (requiredScope && !scopes.has(requiredScope)) {
         return reply.code(403).send({ status: 403, message: "Forbidden" });
       }
 
-      if (requiredRole && !roles.has(requiredRole)) {
+      // role checks are tenant-dependent; without tenant context we can only
+      // evaluate token-embedded roles (if any).
+      if (requiredRole && !headerTenant && !tokenRoles.has(requiredRole)) {
         return reply.code(403).send({ status: 403, message: "Forbidden" });
       }
 
       reply.header("X-User-Id", String(payload.sub));
-      reply.header("X-Tenant-Id", tokenTenant);
       reply.header("X-Token-Jti", String(payload.jti));
+
+      if (headerTenant) {
+        const userId = String(payload.sub);
+        const ctx = await resolveMembershipContext(headerTenant, userId);
+        if (!ctx) {
+          return reply.code(403).send({ status: 403, message: "Forbidden" });
+        }
+
+        if (requiredRole && !ctx.roles.includes(requiredRole)) {
+          return reply.code(403).send({ status: 403, message: "Forbidden" });
+        }
+
+        reply.header("X-Tenant-Id", headerTenant);
+        reply.header("X-User-Role", ctx.role);
+        reply.header("X-User-Plan", ctx.plan);
+        reply.header("X-User-Roles", ctx.roles.join(","));
+      }
+
       return reply.code(204).send();
     } catch {
       return reply.code(401).send({ status: 401, message: "Unauthorized" });

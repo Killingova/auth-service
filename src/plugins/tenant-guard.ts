@@ -36,6 +36,10 @@ function getRouteNeedsAuth(req: any): boolean {
   return (req.routeOptions?.config as any)?.auth === true;
 }
 
+function getRouteNeedsTenant(req: any): boolean {
+  return (req.routeOptions?.config as any)?.tenant === true;
+}
+
 function normalizeHeaderValue(v: unknown): string | undefined {
   if (typeof v === "string") {
     const t = v.trim();
@@ -75,6 +79,11 @@ const tenantGuardPlugin: FastifyPluginAsync = async (app) => {
     const user = request.user as AccessTokenPayload | undefined;
     if (!user) {
       return sendApiError(reply, 401, "INVALID_TOKEN", "Missing auth context.");
+    }
+
+    // Für identity-first Endpoints ist Tenant optional.
+    if (!getRouteNeedsTenant(request)) {
+      return;
     }
 
     // 4) JWT tenant_id ist Pflicht (verifyAccessToken erzwingt das bereits defensiv,

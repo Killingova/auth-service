@@ -5,7 +5,6 @@
 
 export interface UserRow {
   id: string;
-  tenant_id: string;
   email: string;
   is_active: boolean;
   verified_at: Date | null;
@@ -15,7 +14,6 @@ export interface UserRow {
 
 export interface TokenRow {
   id: string;
-  tenant_id: string;
   user_id: string;
   type: string;
   token_hash: string;

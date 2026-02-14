@@ -3,15 +3,15 @@
 // Identity-Routen (RLS-aware)
 // ----------------------------------------------------------------------------
 // Endpoints (relativ zum Prefix /auth):
-// - POST   /login    (tenant=true, auth=false)  -> DB/RLS, kein JWT
-// - POST   /refresh  (tenant=true, auth=false)  -> DB/RLS, kein JWT (opaque refresh)
-// - GET    /me       (tenant=true, auth=true)   -> JWT + blacklist, DB-frei
-// - POST   /logout   (tenant=true, auth=true)   -> JWT + blacklist, DB-frei
+// - POST   /login    (tenant=false, auth=false, db=true)  -> DB/RLS, kein JWT
+// - POST   /refresh  (tenant=false, auth=false, db=true)  -> DB/RLS, kein JWT (opaque refresh)
+// - GET    /me       (tenant=false, auth=true)            -> JWT + blacklist (global)
+// - POST   /logout   (tenant=false, auth=true, db=true)   -> JWT + revoke refresh family
+// - POST   /logout/all (tenant=false, auth=true, db=true) -> JWT + revoke alle refresh token families
 //
 // Security / Tenant:
 // - Tenant-Header ist Pflicht für tenant=true (Gateway setzt X-Tenant-Id).
-// - JWT enthält tenant_id und tenant-guard erzwingt Match (auth=true).
-// - DB/RLS-Kontext wird nur auf verified tenant gesetzt (JWT-Quelle bei auth=true).
+// - tenant_id Claim ist optional (global user Modell).
 // ============================================================================
 
 import type { FastifyInstance } from "fastify";
@@ -37,12 +37,19 @@ import {
   recordAuthRefreshSuccess,
 } from "../../libs/metrics.js";
 import {
+  LoginFailedError,
   loginWithEmailPassword,
   refreshWithToken,
   RefreshFailedError,
   RefreshReuseDetectedError,
 } from "./service.js";
 import type { AccessTokenPayload } from "../../libs/jwt.js";
+import {
+  revokeAllRefreshTokensForUser,
+  revokeAllSessionsForUser,
+  revokeRefreshFamily,
+  revokeSessionByIdForUser,
+} from "./repository.js";
 
 // ---------------------------------------------------------------------------
 // Zod Schemas
@@ -93,47 +100,53 @@ async function applyLoginFailureDelay(): Promise<void> {
 
 export default async function identityRoutes(app: FastifyInstance) {
   // -------------------------------------------------------------------------
-  // POST /auth/login  (tenant required, no JWT)
+  // POST /auth/login  (tenant optional, no JWT)
   // -------------------------------------------------------------------------
   app.post<{ Body: LoginBody }>(
     "/login",
-    { config: { tenant: true, auth: false } },
+    {
+      config: { tenant: false, auth: false, db: true },
+      preValidation: async (req, reply) => {
+        const parsed = LoginBodySchema.safeParse(req.body);
+        if (!parsed.success) {
+          return sendApiError(
+            reply,
+            400,
+            "VALIDATION_FAILED",
+            "Invalid login payload.",
+            parsed.error.flatten(),
+          );
+        }
+        req.body = parsed.data as LoginBody;
+      },
+    },
     async (req, reply) => {
-      const parsed = LoginBodySchema.safeParse(req.body);
-      if (!parsed.success) {
-        return sendApiError(
-          reply,
-          400,
-          "VALIDATION_FAILED",
-          "Invalid login payload.",
-          parsed.error.flatten(),
-        );
-      }
-
       const db = requireDb(app, req, reply);
       if (!db) return;
 
-      const { email, password } = parsed.data;
+      const { email, password } = req.body as LoginBody;
       const emailHash = hashEmailForLog(email);
       const ipHash = hashIpForLog(req.ip || "unknown");
-      const tenantId = (req as any).requestedTenantId as string | undefined;
+      const requestedTenantId = (req as any).requestedTenantId as string | undefined;
 
       try {
-        const lockState = await getLoginFailureState(
-          emailHash,
-          ipHash,
-          env.LOGIN_SOFT_LOCK_MAX_ATTEMPTS,
-          tenantId,
-        );
-        if (lockState.locked) {
-          recordAuthLogin(false);
-          await applyLoginFailureDelay();
-          return sendApiError(
-            reply,
-            401,
-            "LOGIN_FAILED",
-            "Invalid credentials.",
+        if (requestedTenantId) {
+          const lockState = await getLoginFailureState(
+            emailHash,
+            ipHash,
+            env.LOGIN_SOFT_LOCK_MAX_ATTEMPTS,
+            requestedTenantId,
           );
+          if (lockState.locked) {
+            recordAuthLogin(false);
+            await applyLoginFailureDelay();
+            return sendApiError(
+              reply,
+              401,
+              "LOGIN_FAILED",
+              "Invalid credentials.",
+            );
+          }
         }
       } catch (err) {
         app.log.warn({ err }, "login_soft_lock_check_failed");
@@ -143,12 +156,15 @@ export default async function identityRoutes(app: FastifyInstance) {
         const result = await loginWithEmailPassword(db, {
           email,
           password,
+          requestedTenantId,
           ip: req.ip,
           ua: req.headers["user-agent"],
         });
 
+        const resolvedTenantId = result.user.tenantId;
+
         try {
-          await clearLoginFailures(emailHash, ipHash, tenantId);
+          await clearLoginFailures(emailHash, ipHash, resolvedTenantId);
         } catch (err) {
           app.log.warn({ err }, "login_soft_lock_clear_failed");
         }
@@ -156,18 +172,26 @@ export default async function identityRoutes(app: FastifyInstance) {
         recordAuthLogin(true);
 
         // Kurzzeit-Cache (keine sensiblen Daten)
-        await setJSON(
-          `cache:user:${result.user.id}`,
-          { id: result.user.id, email: result.user.email },
-          300,
-          tenantId,
-        );
+        try {
+          await setJSON(
+            `cache:user:${result.user.id}`,
+            { id: result.user.id, email: result.user.email },
+            300,
+            undefined,
+          );
+        } catch (cacheErr) {
+          app.log.warn({ err: cacheErr }, "login_success_cache_failed");
+        }
 
         try {
-          await streamAdd("auth-events", {
-            type: "auth.login_success",
-            sub: result.user.id,
-          }, tenantId);
+          await streamAdd(
+            "auth-events",
+            {
+              type: "auth.login_success",
+              sub: result.user.id,
+            },
+            undefined,
+          );
         } catch (streamErr) {
           app.log.warn({ err: streamErr }, "login_success_stream_failed");
         }
@@ -182,34 +206,49 @@ export default async function identityRoutes(app: FastifyInstance) {
           user: result.user,
         });
       } catch (err) {
-        // Keine Details nach außen
-        app.log.warn({ err, route: "/auth/login", email_hash: emailHash }, "login_failed");
+        if (err instanceof LoginFailedError) {
+          // Keine Details nach außen
+          app.log.warn({ err, route: "/auth/login", email_hash: emailHash }, "login_failed");
+          recordAuthLogin(false);
+          try {
+            if (requestedTenantId) {
+              const state = await registerLoginFailure(
+                emailHash,
+                ipHash,
+                env.LOGIN_SOFT_LOCK_WINDOW_SEC,
+                env.LOGIN_SOFT_LOCK_MAX_ATTEMPTS,
+                requestedTenantId,
+              );
+              await streamAdd(
+                "auth-events",
+                {
+                  type: "auth.login_failed",
+                  email_hash: emailHash,
+                  ip_hash: ipHash,
+                  attempts: state.count,
+                },
+                requestedTenantId,
+              );
+            }
+          } catch (lockErr) {
+            app.log.warn({ err: lockErr }, "login_soft_lock_increment_failed");
+          }
 
-        recordAuthLogin(false);
-        try {
-          const state = await registerLoginFailure(
-            emailHash,
-            ipHash,
-            env.LOGIN_SOFT_LOCK_WINDOW_SEC,
-            env.LOGIN_SOFT_LOCK_MAX_ATTEMPTS,
-            tenantId,
+          await applyLoginFailureDelay();
+          return sendApiError(
+            reply,
+            401,
+            "LOGIN_FAILED",
+            "Invalid credentials.",
           );
-          await streamAdd("auth-events", {
-            type: "auth.login_failed",
-            email_hash: emailHash,
-            ip_hash: ipHash,
-            attempts: state.count,
-          }, tenantId);
-        } catch (lockErr) {
-          app.log.warn({ err: lockErr }, "login_soft_lock_increment_failed");
         }
 
-        await applyLoginFailureDelay();
+        app.log.error({ err, route: "/auth/login", email_hash: emailHash }, "login_internal_failed");
         return sendApiError(
           reply,
-          401,
-          "LOGIN_FAILED",
-          "Invalid credentials.",
+          500,
+          "INTERNAL",
+          "Login temporarily unavailable.",
         );
       }
     },
@@ -220,7 +259,7 @@ export default async function identityRoutes(app: FastifyInstance) {
   // -------------------------------------------------------------------------
   app.post<{ Body: RefreshBody }>(
     "/refresh",
-    { config: { tenant: true, auth: false } },
+    { config: { tenant: false, auth: false, db: true } },
     async (req, reply) => {
       const parsed = RefreshBodySchema.safeParse(req.body);
       if (!parsed.success) {
@@ -235,11 +274,12 @@ export default async function identityRoutes(app: FastifyInstance) {
 
       const db = requireDb(app, req, reply);
       if (!db) return;
-      const tenantId = (req as any).requestedTenantId as string | undefined;
+      const requestedTenantId = (req as any).requestedTenantId as string | undefined;
 
       try {
         const result = await refreshWithToken(db, {
           refreshToken: parsed.data.refresh_token,
+          requestedTenantId,
           ip: req.ip,
           ua: req.headers["user-agent"],
         });
@@ -248,7 +288,7 @@ export default async function identityRoutes(app: FastifyInstance) {
         try {
           await streamAdd("auth-events", {
             type: "auth.refresh_success",
-          }, tenantId);
+          }, requestedTenantId);
         } catch (streamErr) {
           app.log.warn({ err: streamErr }, "refresh_success_stream_failed");
         }
@@ -265,8 +305,8 @@ export default async function identityRoutes(app: FastifyInstance) {
         if (err instanceof RefreshReuseDetectedError) {
           recordAuthRefreshReuseDetected();
           try {
-            await streamAdd("auth-events", { type: "auth.refresh_reuse_detected" }, tenantId);
-            await streamAdd("auth-events", { type: "auth.refresh_family_revoked" }, tenantId);
+            await streamAdd("auth-events", { type: "auth.refresh_reuse_detected" }, requestedTenantId);
+            await streamAdd("auth-events", { type: "auth.refresh_family_revoked" }, requestedTenantId);
           } catch (streamErr) {
             app.log.warn({ err: streamErr }, "refresh_reuse_stream_failed");
           }
@@ -297,7 +337,7 @@ export default async function identityRoutes(app: FastifyInstance) {
   // -------------------------------------------------------------------------
   app.get(
     "/me",
-    { config: { tenant: true, auth: true } },
+    { config: { tenant: false, auth: true } },
     async (req, reply) => {
       const user = req.user as AccessTokenPayload | undefined;
       if (!user) {
@@ -306,13 +346,13 @@ export default async function identityRoutes(app: FastifyInstance) {
 
       const jti = String(user.jti);
 
-      if (await blacklistHas(jti, String(user.tenant_id))) {
+      if (await blacklistHas(jti)) {
         return sendApiError(reply, 401, "TOKEN_REVOKED", "Token has been revoked.");
       }
 
       const cached = await getJSON<{ id: string; email: string }>(
         `cache:user:${user.sub}`,
-        String(user.tenant_id),
+        undefined,
       );
 
       return reply.send({
@@ -339,7 +379,7 @@ export default async function identityRoutes(app: FastifyInstance) {
   // -------------------------------------------------------------------------
   app.post(
     "/logout",
-    { config: { tenant: true, auth: true } },
+    { config: { tenant: false, auth: true, db: true } },
     async (req, reply) => {
       const user = req.user as AccessTokenPayload | undefined;
       if (!user) {
@@ -350,17 +390,81 @@ export default async function identityRoutes(app: FastifyInstance) {
       const now = Math.floor(Date.now() / 1000);
       const ttl = Math.max(1, exp - now);
 
-      await blacklistAdd(String(user.jti), ttl, String(user.tenant_id));
+      const db = requireDb(app, req, reply);
+      if (!db) return;
+
+      await blacklistAdd(String(user.jti), ttl);
+
+      // Best effort: revoke refresh family + session by sid (falls vorhanden).
+      const familyId = typeof user.sid === "string" ? user.sid : undefined;
+      if (familyId) {
+        try {
+          await revokeRefreshFamily(db, familyId);
+        } catch (err) {
+          app.log.warn({ err }, "logout_revoke_refresh_family_failed");
+        }
+        try {
+          await revokeSessionByIdForUser(db, { sessionId: familyId, userId: String(user.sub) });
+        } catch (err) {
+          app.log.warn({ err }, "logout_revoke_session_failed");
+        }
+      }
+
       try {
         await streamAdd("auth-events", {
           type: "auth.logout",
           sub: String(user.sub),
-        }, String(user.tenant_id));
+        });
       } catch (streamErr) {
         app.log.warn({ err: streamErr }, "logout_stream_failed");
       }
 
-      return reply.send({ ok: true });
+      return reply.code(204).send();
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /auth/logout/all  (JWT required; revoke all sessions/refresh tokens)
+  // -------------------------------------------------------------------------
+  app.post(
+    "/logout/all",
+    { config: { tenant: false, auth: true, db: true } },
+    async (req, reply) => {
+      const user = req.user as AccessTokenPayload | undefined;
+      if (!user) {
+        return sendApiError(reply, 401, "INVALID_TOKEN", "Missing auth context.");
+      }
+
+      const exp = Number(user.exp ?? 0);
+      const now = Math.floor(Date.now() / 1000);
+      const ttl = Math.max(1, exp - now);
+
+      const db = requireDb(app, req, reply);
+      if (!db) return;
+
+      await blacklistAdd(String(user.jti), ttl);
+
+      try {
+        await revokeAllRefreshTokensForUser(db, String(user.sub));
+      } catch (err) {
+        app.log.warn({ err }, "logout_all_revoke_refresh_failed");
+      }
+      try {
+        await revokeAllSessionsForUser(db, String(user.sub));
+      } catch (err) {
+        app.log.warn({ err }, "logout_all_revoke_sessions_failed");
+      }
+
+      try {
+        await streamAdd("auth-events", {
+          type: "auth.logout_all",
+          sub: String(user.sub),
+        });
+      } catch (streamErr) {
+        app.log.warn({ err: streamErr }, "logout_all_stream_failed");
+      }
+
+      return reply.code(204).send();
     },
   );
 }

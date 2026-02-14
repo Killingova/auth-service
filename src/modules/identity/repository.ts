@@ -8,91 +8,37 @@
 // ============================================================================
 
 import type { DbClient } from "../../libs/db.js";
-import type { RefreshTokenRow, SessionRow, UserRow } from "./types.js";
+import type {
+  LoginCandidateRow,
+  RefreshTokenRow,
+  SessionRow,
+  UserRow,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // User + Credentials
 // ---------------------------------------------------------------------------
 
-export async function findUserByEmail(
-  client: DbClient,
-  email: string,
-): Promise<UserRow | null> {
-  const { rows } = await client.query<UserRow>(
-    `
-      SELECT
-        u.id,
-        u.tenant_id,
-        u.email,
-        c.password_hash,
-        u.is_active,
-        u.verified_at,
-        u.created_at,
-        u.updated_at,
-        p.code AS plan_code,
-        COALESCE(array_agg(DISTINCT r.name ORDER BY r.name) FILTER (WHERE r.name IS NOT NULL), ARRAY[]::text[]) AS role_names
-      FROM auth.users u
-      JOIN auth.credentials c
-        ON c.user_id = u.id
-       AND c.tenant_id = u.tenant_id
-      JOIN auth.tenants t
-        ON t.id = u.tenant_id
-      LEFT JOIN auth.plans p
-        ON p.id = t.plan_id
-      LEFT JOIN auth.memberships m
-        ON m.tenant_id = u.tenant_id
-       AND m.user_id = u.id
-      LEFT JOIN auth.roles r
-        ON r.id = m.role_id
-       AND r.tenant_id = m.tenant_id
-      WHERE u.email = $1
-      GROUP BY
-        u.id,
-        u.tenant_id,
-        u.email,
-        c.password_hash,
-        u.is_active,
-        u.verified_at,
-        u.created_at,
-        u.updated_at,
-        p.code
-      LIMIT 1;
-    `,
-    [email.toLowerCase()],
-  );
-
-  return rows[0] ?? null;
-}
-
-export async function findUserAuthContextById(
+export async function findLoginCandidateByEmail(
   client: DbClient,
   opts: {
-    tenantId: string;
-    userId: string;
+    email: string;
+    requestedTenantId?: string;
   },
-): Promise<Pick<UserRow, "plan_code" | "role_names"> | null> {
-  const { rows } = await client.query<Pick<UserRow, "plan_code" | "role_names">>(
+): Promise<LoginCandidateRow | null> {
+  const { rows } = await client.query<LoginCandidateRow>(
     `
       SELECT
-        p.code AS plan_code,
-        COALESCE(array_agg(DISTINCT r.name ORDER BY r.name) FILTER (WHERE r.name IS NOT NULL), ARRAY[]::text[]) AS role_names
-      FROM auth.users u
-      JOIN auth.tenants t
-        ON t.id = u.tenant_id
-      LEFT JOIN auth.plans p
-        ON p.id = t.plan_id
-      LEFT JOIN auth.memberships m
-        ON m.tenant_id = u.tenant_id
-       AND m.user_id = u.id
-      LEFT JOIN auth.roles r
-        ON r.id = m.role_id
-       AND r.tenant_id = m.tenant_id
-      WHERE u.tenant_id = $1
-        AND u.id = $2
-      GROUP BY p.code
+        user_id AS id,
+        tenant_id,
+        email,
+        password_hash,
+        is_active,
+        verified_at
+      FROM auth.resolve_login_candidate($1::extensions.citext, $2::uuid)
       LIMIT 1;
     `,
-    [opts.tenantId, opts.userId],
+    [opts.email.toLowerCase(), opts.requestedTenantId ?? null],
   );
 
   return rows[0] ?? null;
@@ -105,7 +51,6 @@ export async function findUserAuthContextById(
 export async function createSession(
   client: DbClient,
   opts: {
-    tenantId: string;
     userId: string;
     ttlSec: number;
     sessionId?: string;
@@ -115,20 +60,57 @@ export async function createSession(
 
   const { rows } = await client.query<SessionRow>(
     `
-      INSERT INTO auth.sessions (id, tenant_id, user_id, expires_at)
-      VALUES (COALESCE($1::uuid, extensions.gen_random_uuid()), $2, $3, $4)
+      INSERT INTO auth.sessions (id, user_id, expires_at)
+      VALUES (COALESCE($1::uuid, extensions.gen_random_uuid()), $2, $3)
       RETURNING
         id,
-        tenant_id,
         user_id,
         created_at,
         expires_at,
         revoked_at;
     `,
-    [opts.sessionId ?? null, opts.tenantId, opts.userId, expires],
+    [opts.sessionId ?? null, opts.userId, expires],
   );
 
   return rows[0];
+}
+
+export async function revokeSessionByIdForUser(
+  client: DbClient,
+  opts: {
+    sessionId: string;
+    userId: string;
+  },
+): Promise<boolean> {
+  const res = await client.query(
+    `
+      UPDATE auth.sessions
+      SET revoked_at = now()
+      WHERE id = $1
+        AND user_id = $2
+        AND revoked_at IS NULL;
+    `,
+    [opts.sessionId, opts.userId],
+  );
+
+  return (res.rowCount ?? 0) > 0;
+}
+
+export async function revokeAllSessionsForUser(
+  client: DbClient,
+  userId: string,
+): Promise<number> {
+  const res = await client.query(
+    `
+      UPDATE auth.sessions
+      SET revoked_at = now()
+      WHERE user_id = $1
+        AND revoked_at IS NULL;
+    `,
+    [userId],
+  );
+
+  return res.rowCount ?? 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +120,6 @@ export async function createSession(
 export async function createRefreshTokenRecord(
   client: DbClient,
   opts: {
-    tenantId: string;
     userId: string;
     tokenHash: string;
     ttlSec: number;
@@ -150,7 +131,6 @@ export async function createRefreshTokenRecord(
   const { rows } = await client.query<RefreshTokenRow>(
     `
       INSERT INTO auth.refresh_tokens (
-        tenant_id,
         user_id,
         token_hash,
         family_id,
@@ -159,13 +139,11 @@ export async function createRefreshTokenRecord(
       VALUES (
         $1,
         $2,
-        $3,
-        COALESCE($4::uuid, extensions.gen_random_uuid()),
-        $5
+        COALESCE($3::uuid, extensions.gen_random_uuid()),
+        $4
       )
       RETURNING
         id,
-        tenant_id,
         user_id,
         token_hash,
         family_id,
@@ -174,7 +152,7 @@ export async function createRefreshTokenRecord(
         created_at,
         expires_at;
     `,
-    [opts.tenantId, opts.userId, opts.tokenHash, opts.familyId ?? null, expires],
+    [opts.userId, opts.tokenHash, opts.familyId ?? null, expires],
   );
 
   return rows[0];
@@ -188,7 +166,6 @@ export async function findActiveRefreshTokenByHash(
     `
       SELECT
         id,
-        tenant_id,
         user_id,
         token_hash,
         family_id,
@@ -216,7 +193,6 @@ export async function findRefreshTokenByHash(
     `
       SELECT
         id,
-        tenant_id,
         user_id,
         token_hash,
         family_id,
@@ -286,170 +262,68 @@ export async function revokeRefreshFamily(
   return result.rowCount ?? 0;
 }
 
-export async function ensureUserHasMembership(
+export async function revokeAllRefreshTokensForUser(
+  client: DbClient,
+  userId: string,
+): Promise<number> {
+  const result = await client.query(
+    `
+      UPDATE auth.refresh_tokens
+      SET revoked_at = now()
+      WHERE user_id = $1
+        AND revoked_at IS NULL;
+    `,
+    [userId],
+  );
+
+  return result.rowCount ?? 0;
+}
+
+export async function resolveUserAuthContext(
   client: DbClient,
   opts: {
-    tenantId: string;
     userId: string;
+    requestedTenantId?: string;
   },
 ): Promise<{
+  tenantId?: string;
   role: string;
   roles: string[];
   plan: string;
 }> {
-  try {
-    const { rows } = await client.query<{
-      tenant_id: string;
-      role: string;
-      plan_code: string;
-    }>(
-      `
-        SELECT
-          tenant_id,
-          role,
-          plan_code
-        FROM auth.bootstrap_tenant_for_user($1);
-      `,
-      [opts.userId],
-    );
-
-    const row = rows[0];
-    if (!row) {
-      throw new Error("membership_bootstrap_failed");
-    }
-
-    const roleList = await client.query<{ name: string }>(
-      `
-        SELECT r.name
-        FROM auth.memberships m
-        JOIN auth.roles r
-          ON r.id = m.role_id
-         AND r.tenant_id = m.tenant_id
-        WHERE m.tenant_id = $1
-          AND m.user_id = $2
-        ORDER BY r.name ASC;
-      `,
-      [opts.tenantId, opts.userId],
-    );
-
-    const roles = roleList.rows.length
-      ? roleList.rows.map((item) => item.name)
-      : [row.role || "member"];
-
-    return {
-      role: row.role || roles[0] || "member",
-      roles,
-      plan: row.plan_code || "free",
-    };
-  } catch (err: any) {
-    // Backward-compatibility, bis DB-Migration 0002 ueberall ausgerollt ist.
-    if (err?.code !== "42883") {
-      throw err;
-    }
-  }
-
-  try {
-    const { rows } = await client.query<{
-      tenant_id: string;
-      primary_role: string;
-      role_names: string[];
-      plan_code: string;
-    }>(
-      `
-        SELECT
-          tenant_id,
-          primary_role,
-          role_names,
-          plan_code
-        FROM auth.bootstrap_user_auth_context($1, $2, $3);
-      `,
-      [opts.tenantId, opts.userId, "member"],
-    );
-
-    const row = rows[0];
-    if (!row) {
-      throw new Error("membership_bootstrap_failed");
-    }
-
-    const roles = row.role_names?.length ? row.role_names : [row.primary_role || "member"];
-
-    return {
-      role: row.primary_role || roles[0] || "member",
-      roles,
-      plan: row.plan_code || "free",
-    };
-  } catch (err: any) {
-    if (err?.code !== "42883") {
-      throw err;
-    }
-  }
-
-  await client.query("SELECT pg_advisory_xact_lock(hashtext($1));", [opts.userId]);
-
-  const existing = await client.query<{ name: string }>(
+  const { rows } = await client.query<{
+    tenant_id: string | null;
+    role: string | null;
+    plan_code: string | null;
+    role_names: string[] | null;
+  }>(
     `
-      SELECT r.name
-      FROM auth.memberships m
-      JOIN auth.roles r
-        ON r.id = m.role_id
-       AND r.tenant_id = m.tenant_id
-      WHERE m.tenant_id = $1
-        AND m.user_id = $2
-      ORDER BY r.name ASC;
+      SELECT
+        tenant_id,
+        role,
+        plan_code,
+        role_names
+      FROM auth.resolve_user_auth_context($1, $2);
     `,
-    [opts.tenantId, opts.userId],
+    [opts.userId, opts.requestedTenantId ?? null],
   );
 
-  const planResult = await client.query<{ code: string | null }>(
-    `
-      SELECT p.code
-      FROM auth.tenants t
-      LEFT JOIN auth.plans p
-        ON p.id = t.plan_id
-      WHERE t.id = $1
-      LIMIT 1;
-    `,
-    [opts.tenantId],
-  );
-  const plan = planResult.rows[0]?.code || "free";
-
-  if (existing.rowCount && existing.rowCount > 0) {
-    const roles = existing.rows.map((row) => row.name);
-    return {
-      role: roles[0] ?? "member",
-      roles,
-      plan,
-    };
+  const row = rows[0];
+  if (!row) {
+    throw new Error("resolve_user_auth_context_failed");
   }
 
-  const roleInsert = await client.query<{ id: string }>(
-    `
-      INSERT INTO auth.roles (tenant_id, name)
-      VALUES ($1, $2)
-      ON CONFLICT (tenant_id, name) DO UPDATE
-        SET name = EXCLUDED.name
-      RETURNING id;
-    `,
-    [opts.tenantId, "member"],
-  );
+  const rolesFromDb = Array.isArray(row.role_names)
+    ? row.role_names.filter((value) => typeof value === "string" && value.trim().length > 0)
+    : [];
 
-  const roleId = roleInsert.rows[0]?.id;
-  if (!roleId) {
-    throw new Error("role_bootstrap_failed");
-  }
-
-  await client.query(
-    `
-      INSERT INTO auth.memberships (tenant_id, user_id, role_id)
-      VALUES ($1, $2, $3)
-      ON CONFLICT DO NOTHING;
-    `,
-    [opts.tenantId, opts.userId, roleId],
-  );
+  const role = (row.role ?? rolesFromDb[0] ?? "member").trim() || "member";
+  const roles = rolesFromDb.length > 0 ? rolesFromDb : [role];
 
   return {
-    role: "member",
-    roles: ["member"],
-    plan,
+    tenantId: row.tenant_id ?? undefined,
+    role,
+    roles,
+    plan: row.plan_code ?? "free",
   };
 }

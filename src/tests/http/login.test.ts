@@ -3,8 +3,6 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../../app.js";
 
-const TENANT_ID = "00000000-0000-4000-8000-000000000001";
-
 let app: FastifyInstance;
 
 describe("POST /auth/login", () => {
@@ -21,9 +19,6 @@ describe("POST /auth/login", () => {
     const res = await app.inject({
       method: "POST",
       url: "/auth/login",
-      headers: {
-        "x-tenant-id": TENANT_ID,
-      },
       payload: {
         email: "not-an-email",
         // password intentionally omitted → should fail Zod validation

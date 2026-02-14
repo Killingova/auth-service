@@ -27,7 +27,9 @@ const UUID_RE =
 
 function needsTenant(req: any): boolean {
   const cfg = req.routeOptions?.config as any;
-  return cfg?.tenant === true || cfg?.auth === true;
+  // tenant ist nur dann Pflicht, wenn die Route das explizit verlangt.
+  // auth=true bedeutet nur "authenticated user", nicht "tenant-bound".
+  return cfg?.tenant === true;
 }
 
 function normalizeHeader(v: unknown): string | undefined {
@@ -63,6 +65,16 @@ const tenantContextPlugin: FastifyPluginAsync = async (fastify: FastifyInstance)
           "Missing or invalid X-Tenant-Id header.",
         );
       }
+    }
+
+    // Optionaler Header bleibt erlaubt, muss aber bei Angabe valide sein.
+    if (headerTenant && !UUID_RE.test(headerTenant)) {
+      return sendApiError(
+        reply,
+        400,
+        "VALIDATION_FAILED",
+        "Missing or invalid X-Tenant-Id header.",
+      );
     }
 
     // Nur als "requested", NICHT als verified tenant

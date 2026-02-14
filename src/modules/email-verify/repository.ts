@@ -15,7 +15,6 @@ export async function findUserByEmailRow(
     `
       SELECT
         id,
-        tenant_id,
         email,
         is_active,
         verified_at,
@@ -39,7 +38,6 @@ export async function findUserById(
     `
       SELECT
         id,
-        tenant_id,
         email,
         is_active,
         verified_at,
@@ -69,7 +67,6 @@ export async function markUserVerifiedById(
       WHERE id = $1
       RETURNING
         id,
-        tenant_id,
         email,
         is_active,
         verified_at,
@@ -99,11 +96,10 @@ export async function createEmailVerifyTokenRecord(
 
   const { rows } = await db.query<TokenRow>(
     `
-      INSERT INTO auth.tokens (tenant_id, user_id, type, token_hash, expires_at)
-      VALUES (meta.require_tenant_id(), $1, 'verify_email', $2, $3)
+      INSERT INTO auth.tokens (user_id, type, token_hash, expires_at)
+      VALUES ($1, 'verify_email', $2, $3)
       RETURNING
         id,
-        tenant_id,
         user_id,
         type,
         token_hash,
@@ -125,7 +121,6 @@ export async function findVerifyTokenByRawToken(
     `
       SELECT
         id,
-        tenant_id,
         user_id,
         type,
         token_hash,

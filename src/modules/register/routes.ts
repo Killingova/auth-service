@@ -31,7 +31,6 @@ import type { DbClient } from "../../libs/db.js";
 import {
   registerUser,
   getRegisterHealth,
-  EmailAlreadyRegisteredError,
 } from "./service.js";
 
 // ---------------------------------------------------------------------------
@@ -68,22 +67,19 @@ export default async function registerRoutes(app: FastifyInstance) {
   // -------------------------------------------------------------------------
   app.post(
     "/register",
-    { config: { tenant: true, auth: false } },
+    { config: { tenant: false, auth: false, db: true } },
     async (req, reply) => {
     const parsed = RegisterBodySchema.safeParse(req.body);
 
     // 1) Body-Validierung
     if (!parsed.success) {
-      const errorDetails = parsed.error.flatten();
-
-      return reply.code(400).send({
-        error: {
-          code: "REGISTER_VALIDATION_FAILED",
-          message: "Ungültige Eingabe.",
-          details: errorDetails,
-        },
-        statusCode: 400,
-      });
+      return sendApiError(
+        reply,
+        400,
+        "VALIDATION_FAILED",
+        "Invalid register payload.",
+        parsed.error.flatten(),
+      );
     }
 
     const body: RegisterBody = parsed.data;
@@ -96,7 +92,6 @@ export default async function registerRoutes(app: FastifyInstance) {
     //   ausgeführt wurden.
     // - Wir casten hier leicht, damit TypeScript weiß, dass db existiert.
     const { db } = req as typeof req & { db: DbClient };
-    const tenantId = (req as any).requestedTenantId as string | undefined;
 
     try {
       // 3) Business-Logik (Service-Layer)
@@ -120,42 +115,19 @@ export default async function registerRoutes(app: FastifyInstance) {
       //    Fehler beim Stream dürfen die Registrierung NICHT abbrechen.
       try {
         await streamAdd("auth-events", {
-          type: "user_registered",
-          sub: result.user.id,
-        }, tenantId);
+          type: "auth.register",
+          requestAccepted: result.requestAccepted ? 1 : 0,
+        });
       } catch (err) {
         app.log.warn({ err }, "register_stream_failed");
       }
 
-      // 5) Erfolgsantwort (201 Created)
-      //    Nur minimale Daten zurückgeben, keine Tokens, kein Tenant, keine
-      //    internen Metadaten → datensparsam, gut cachbar, Frontend-freundlich.
-      return reply.code(201).send({
-        user: {
-          id: result.user.id,
-          email: result.user.email,
-          createdAt: result.user.createdAt,
-        },
+      // 5) Erfolgsantwort: immer gleich (Anti-Enumeration)
+      return reply.code(202).send({
+        ok: true,
+        message: "Wenn die E-Mail-Adresse gültig ist, erhältst du einen Verifizierungs-Link.",
       });
     } catch (err: any) {
-      // Erwarteter Business-Fehler: E-Mail bereits vergeben
-      // DSGVO / Security: KEINE Info, ob Account existiert.
-      if (err instanceof EmailAlreadyRegisteredError) {
-        app.log.warn(
-          { email: body.email },
-          "registration_email_already_in_use",
-        );
-
-        return reply.code(400).send({
-          error: {
-            code: "REGISTER_NOT_POSSIBLE",
-            message:
-              "Registrierung konnte nicht durchgeführt werden. Bitte verwende ggf. eine andere E-Mail-Adresse.",
-          },
-          statusCode: 400,
-        });
-      }
-
       const mapped = mapDbError(err);
       return sendApiError(reply, mapped.status, mapped.code, mapped.message);
     }

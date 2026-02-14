@@ -6,7 +6,9 @@
 // - HS256 Symmetric Key (JWT_SECRET via env.ts, secrets-first)
 // - JTI pro Token (Blacklist/Audit möglich)
 // - typ="access" im Payload
-// - tenant_id ist PFLICHT (cryptographically bound tenant)
+// - tenant_id ist optional:
+//   * Model A (tenant-bound token): tenant_id vorhanden
+//   * Model B (global identity token): tenant_id fehlt; Tenant wird via membership geprüft
 // ============================================================================
 
 import crypto from "node:crypto";
@@ -67,7 +69,7 @@ export interface AccessTokenPayload extends JWTPayload {
 
   // Unsere Pflicht-Claims
   typ: "access";
-  tenant_id: string;    // UUID (cryptographically bound tenant)
+  tenant_id?: string;   // UUID (wenn tenant-bound)
   tid?: string;         // optionaler Alias
   sid?: string;         // Session / Refresh family id
   ver?: number;         // Claim schema version
@@ -97,13 +99,17 @@ type AccessTokenExtraClaims = {
 
 export async function signAccessToken(
   sub: string,
-  tenantId: string,
+  tenantId?: string,
   ttlSec: number = DEFAULT_ACCESS_TTL_SEC,
   extraClaims: AccessTokenExtraClaims = {},
 ): Promise<{ token: string; jti: string; exp: number }> {
   // Defensive Validation (fail fast, sauberer Fehler)
   if (!sub || typeof sub !== "string") throw new Error("sub_missing");
-  assertUuid(tenantId, "tenant_id");
+  if (tenantId !== undefined && tenantId !== null && tenantId !== "") {
+    assertUuid(tenantId, "tenant_id");
+  } else {
+    tenantId = undefined;
+  }
 
   if (extraClaims.sid) {
     assertUuid(extraClaims.sid, "sid");
@@ -116,9 +122,8 @@ export async function signAccessToken(
   // Payload enthält typ + tenant_id (wird signiert -> kann nicht gefälscht werden)
   const token = await new SignJWT({
     typ: "access",
-    tenant_id: tenantId,
-    tid: tenantId,
     ver: typeof extraClaims.ver === "number" ? extraClaims.ver : 1,
+    ...(tenantId ? { tenant_id: tenantId, tid: tenantId } : {}),
     ...(extraClaims.sid ? { sid: extraClaims.sid } : {}),
     ...(extraClaims.role ? { role: extraClaims.role } : {}),
     ...(Array.isArray(extraClaims.roles) ? { roles: extraClaims.roles } : {}),
@@ -176,11 +181,16 @@ export async function verifyAccessToken(token: string): Promise<AccessTokenPaylo
     throw new Error("jti_missing");
   }
 
-  // tenant_id Pflicht + UUID-Format
-  const tokenTenant = (payload as any).tenant_id ?? (payload as any).tid;
-  assertUuid(tokenTenant, "tenant_id");
-  (payload as any).tenant_id = tokenTenant;
-  (payload as any).tid = tokenTenant;
+  // tenant_id ist optional; wenn vorhanden: UUID-Format erzwingen
+  const tokenTenantRaw = (payload as any).tenant_id ?? (payload as any).tid;
+  if (tokenTenantRaw !== undefined && tokenTenantRaw !== null && tokenTenantRaw !== "") {
+    assertUuid(tokenTenantRaw, "tenant_id");
+    (payload as any).tenant_id = tokenTenantRaw;
+    (payload as any).tid = tokenTenantRaw;
+  } else {
+    delete (payload as any).tenant_id;
+    delete (payload as any).tid;
+  }
 
   const tokenSid = (payload as any).sid;
   if (tokenSid !== undefined) {

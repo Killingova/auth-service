@@ -21,7 +21,6 @@ export interface TenantRow {
 
 export interface UserRow {
   id: string;
-  tenant_id: string;
   email: string;
   is_active: boolean;
   verified_at: Date | null;
@@ -43,7 +42,6 @@ export type TokenKind =
 
 export interface TokenRow {
   id: string;
-  tenant_id: string;
   user_id: string;
   type: TokenKind;
   token_hash: string;
@@ -111,7 +109,7 @@ export interface RegisterInput extends RegisterRequestBody {
  * Wird von service.ts verwendet und von der Route nach außen serialisiert.
  */
 export interface RegisterResult {
-  user: PublicUser;
+  requestAccepted: boolean;
 }
 
 /**

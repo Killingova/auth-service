@@ -18,20 +18,26 @@
 
 export interface UserRow {
   id: string;
-  tenant_id: string;
   email: string;
-  password_hash: string;
   is_active: boolean;
   verified_at: string | null;
   created_at: string;
   updated_at: string;
-  plan_code: string | null;
-  role_names: string[];
+  primary_tenant_id: string | null;
+  last_active_tenant_id: string | null;
+}
+
+export interface LoginCandidateRow {
+  id: string;
+  tenant_id: string | null;
+  email: string;
+  password_hash: string;
+  is_active: boolean;
+  verified_at: string | null;
 }
 
 export interface SessionRow {
   id: string;
-  tenant_id: string;
   user_id: string;
   created_at: string;
   expires_at: string;
@@ -40,7 +46,6 @@ export interface SessionRow {
 
 export interface RefreshTokenRow {
   id: string;
-  tenant_id: string;
   user_id: string;
   token_hash: string;
   family_id: string;
@@ -62,6 +67,7 @@ export interface RefreshTokenRow {
 export interface LoginInput {
   email: string;
   password: string;
+  requestedTenantId?: string;
   ip?: string;
   ua?: string;
 }
@@ -70,7 +76,7 @@ export interface LoginResult {
   user: {
     id: string;
     email: string;
-    tenantId: string; // CamelCase-Variante von tenant_id (API-freundlich)
+    tenantId?: string; // optional (global user Modell: vor Onboarding kein Tenant)
     role: string;
     roles: string[];
     plan: string;
@@ -84,6 +90,7 @@ export interface LoginResult {
 
 export interface RefreshInput {
   refreshToken: string;
+  requestedTenantId?: string;
   ip?: string;
   ua?: string;
 }

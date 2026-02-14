@@ -63,7 +63,6 @@ export async function findUserByEmailRow(
     `
       SELECT
         id,
-        tenant_id,
         email,
         is_active,
         verified_at,
@@ -177,11 +176,10 @@ export async function createUserRow(opts: {
 
   const { rows } = await client.query<UserRow>(
     `
-      INSERT INTO auth.users (tenant_id, email, is_active)
-      VALUES (meta.require_tenant_id(), $1, $2)
+      INSERT INTO auth.users (email, is_active)
+      VALUES ($1, $2)
       RETURNING
         id,
-        tenant_id,
         email,
         is_active,
         verified_at,
@@ -196,17 +194,16 @@ export async function createUserRow(opts: {
 
 export async function createCredentialsRow(opts: {
   client: DbClient;
-  tenantId: string;
   userId: string;
   passwordHash: string;
 }): Promise<void> {
-  const { client, tenantId, userId, passwordHash } = opts;
+  const { client, userId, passwordHash } = opts;
   await client.query(
     `
-      INSERT INTO auth.credentials (tenant_id, user_id, password_hash)
-      VALUES ($1, $2, $3);
+      INSERT INTO auth.credentials (user_id, password_hash)
+      VALUES ($1, $2);
     `,
-    [tenantId, userId, passwordHash],
+    [userId, passwordHash],
   );
 }
 
@@ -232,7 +229,6 @@ export async function insertUser(
 
   await createCredentialsRow({
     client,
-    tenantId: userRow.tenant_id,
     userId: userRow.id,
     passwordHash,
   });
@@ -268,11 +264,10 @@ export async function createEmailVerifyTokenRecord(opts: {
 
   const { rows } = await client.query<TokenRow>(
     `
-      INSERT INTO auth.tokens (tenant_id, user_id, type, token_hash, expires_at)
-      VALUES (meta.require_tenant_id(), $1, 'verify_email', $2, $3)
+      INSERT INTO auth.tokens (user_id, type, token_hash, expires_at)
+      VALUES ($1, 'verify_email', $2, $3)
       RETURNING
         id,
-        tenant_id,
         user_id,
         type,
         token_hash,

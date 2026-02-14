@@ -17,14 +17,9 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
 import type { DbClient } from "../../libs/db.js";
-import {
-  getIdempotencyKey,
-  readIdempotentResponse,
-  writeIdempotentResponse,
-} from "../../libs/idempotency.js";
-import { appendOutboxEvent } from "../../libs/outbox.js";
 import { hashEmailForLog } from "../../libs/pii.js";
 import { streamAdd } from "../../libs/redis.js";
+import { sendApiError } from "../../libs/error-response.js";
 import {
   requestEmailVerification,
   verifyEmailToken,
@@ -51,6 +46,13 @@ const VerifyConfirmQuerySchema = z.object({
 });
 
 type VerifyConfirmQuery = z.infer<typeof VerifyConfirmQuerySchema>;
+
+// POST /auth/email/verify/confirm
+const VerifyConfirmBodySchema = z.object({
+  token: z.string().min(1, "Token ist Pflicht."),
+});
+
+type VerifyConfirmBody = z.infer<typeof VerifyConfirmBodySchema>;
 
 // ---------------------------------------------------------------------------
 // Routen-Plugin
@@ -81,7 +83,7 @@ export default async function emailVerifyRoutes(app: FastifyInstance) {
   //
   app.post<{ Body: VerifyRequestBody }>(
     "/verify/request",
-    { config: { tenant: true, auth: false } },
+    { config: { tenant: false, auth: false, db: true } },
     async (req, reply) => {
     const parsed = VerifyRequestBodySchema.safeParse(req.body);
 
@@ -99,20 +101,6 @@ export default async function emailVerifyRoutes(app: FastifyInstance) {
 
     const { email } = parsed.data;
     const db = (req as any).db as DbClient;
-    const tenantId = (req as any).requestedTenantId as string | undefined;
-    const idempotencyKey = getIdempotencyKey(req.headers["idempotency-key"]);
-
-    if (tenantId && idempotencyKey) {
-      const existing = await readIdempotentResponse(db, {
-        tenantId,
-        endpoint: "POST:/auth/email/verify/request",
-        idempotencyKey,
-      });
-
-      if (existing) {
-        return reply.code(existing.status_code).send(existing.response_body);
-      }
-    }
 
     try {
       // Der Service entscheidet selbst, ob:
@@ -127,18 +115,6 @@ export default async function emailVerifyRoutes(app: FastifyInstance) {
         ua: req.headers["user-agent"],
       });
 
-      if (tenantId) {
-        await appendOutboxEvent(db, {
-          tenantId,
-          eventType: "auth.email_verify_requested",
-          payload: {
-            email_hash: hashEmailForLog(email),
-            request_accepted: result.requestAccepted,
-          },
-          idempotencyKey,
-        });
-      }
-
       // Optionales Event für Worker / Audit:
       // - E-Mail wird gehasht oder weg gelassen, um DSGVO-/Security-Risiken
       //   zu minimieren.
@@ -148,31 +124,16 @@ export default async function emailVerifyRoutes(app: FastifyInstance) {
           // kein Klartext, maximal Hash/Metadaten
           email_hash: hashEmailForLog(email),
           status: result.requestAccepted ? "accepted" : "ignored",
-        }, tenantId);
+        });
       } catch (err) {
         app.log.warn({ err }, "email_verify_request_stream_failed");
       }
 
-      // Generische Antwort – "wir haben, was wir tun konnten, getan".
-      // Kein Leak, ob E-Mail bekannt ist.
-      const responseBody = {
+      // Generische Antwort – kein Leak, ob E-Mail bekannt ist.
+      return reply.code(202).send({
         ok: true,
-        // Optionales Flag, nur für Frontend-UX – aber ohne Sicherheitsrisiko:
-        // z.B. false, wenn der User schon verifiziert war.
-        requestAccepted: result.requestAccepted,
-      };
-
-      if (tenantId && idempotencyKey) {
-        await writeIdempotentResponse(db, {
-          tenantId,
-          endpoint: "POST:/auth/email/verify/request",
-          idempotencyKey,
-          statusCode: 200,
-          responseBody,
-        });
-      }
-
-      return reply.code(200).send(responseBody);
+        message: "Wenn die E-Mail-Adresse gültig ist, erhältst du einen Verifizierungs-Link.",
+      });
     } catch (err) {
       // Unerwartete Fehler → globaler Error-Handler (app.ts)
       throw err;
@@ -192,7 +153,7 @@ export default async function emailVerifyRoutes(app: FastifyInstance) {
   //
   app.get<{ Querystring: VerifyConfirmQuery }>(
     "/verify/confirm",
-    { config: { tenant: true, auth: false } },
+    { config: { tenant: false, auth: false, db: true } },
     async (req, reply) => {
     const parsed = VerifyConfirmQuerySchema.safeParse(req.query);
 
@@ -209,7 +170,6 @@ export default async function emailVerifyRoutes(app: FastifyInstance) {
     }
 
     const { token } = parsed.data;
-    const tenantId = (req as any).requestedTenantId as string | undefined;
 
     try {
       const db = (req as any).db as DbClient;
@@ -220,58 +180,73 @@ export default async function emailVerifyRoutes(app: FastifyInstance) {
         await streamAdd("auth-events", {
           type: "email_verified",
           sub: result.user.id,
-        }, tenantId);
+        });
       } catch (err) {
         app.log.warn({ err }, "email_verify_confirm_stream_failed");
       }
 
-      return reply.code(200).send({
-        verified: true,
-        alreadyVerified: result.alreadyVerified ?? false,
-        user: {
-          id: result.user.id,
-          email: result.user.email,
-        },
-      });
+      return reply.code(204).send();
     } catch (err: any) {
       // Erwartete Business-Fehler → sauber auf HTTP mappen
 
       if (err instanceof InvalidVerifyTokenError) {
         app.log.warn("email_verify_invalid_token");
-        return reply.code(400).send({
-          error: {
-            code: "EMAIL_VERIFY_INVALID_TOKEN",
-            message: "Das Verifikations-Token ist ungültig.",
-          },
-          statusCode: 400,
-        });
+        return sendApiError(reply, 400, "EMAIL_VERIFY_INVALID_TOKEN", "Invalid verification token.");
       }
 
       if (err instanceof ExpiredVerifyTokenError) {
         app.log.info("email_verify_expired_token");
         // 410 Gone: Token war mal gültig, ist aber nicht mehr verwendbar.
-        return reply.code(410).send({
-          error: {
-            code: "EMAIL_VERIFY_TOKEN_EXPIRED",
-            message: "Das Verifikations-Token ist abgelaufen.",
-          },
-          statusCode: 410,
-        });
+        return sendApiError(reply, 410, "EMAIL_VERIFY_TOKEN_EXPIRED", "Verification token expired.");
       }
 
       if (err instanceof AlreadyVerifiedError) {
         app.log.info({ reason: "already_verified" }, "email_verify_already_verified");
-        // 200 oder 409 – Designentscheidung.
-        // Hier: 200, damit der Link idempotent ist und UX-freundlich bleibt.
-        return reply.code(200).send({
-          verified: true,
-          alreadyVerified: true,
-        });
+        // Idempotent: der Link darf wiederholt verwendet werden.
+        return reply.code(204).send();
       }
 
       // Unerwartetes → globaler Error-Handler
       throw err;
     }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /auth/email/verify/confirm  (Alias fuer SPA-Clients)
+  // -------------------------------------------------------------------------
+  app.post<{ Body: VerifyConfirmBody }>(
+    "/verify/confirm",
+    { config: { tenant: false, auth: false, db: true } },
+    async (req, reply) => {
+      const parsed = VerifyConfirmBodySchema.safeParse(req.body);
+
+      if (!parsed.success) {
+        return sendApiError(
+          reply,
+          400,
+          "VALIDATION_FAILED",
+          "Invalid verify payload.",
+          parsed.error.flatten(),
+        );
+      }
+
+      try {
+        const db = (req as any).db as DbClient;
+        await verifyEmailToken(db, { token: parsed.data.token });
+        return reply.code(204).send();
+      } catch (err: any) {
+        if (err instanceof InvalidVerifyTokenError) {
+          return sendApiError(reply, 400, "EMAIL_VERIFY_INVALID_TOKEN", "Invalid verification token.");
+        }
+        if (err instanceof ExpiredVerifyTokenError) {
+          return sendApiError(reply, 410, "EMAIL_VERIFY_TOKEN_EXPIRED", "Verification token expired.");
+        }
+        if (err instanceof AlreadyVerifiedError) {
+          return reply.code(204).send();
+        }
+        throw err;
+      }
     },
   );
 

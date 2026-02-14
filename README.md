@@ -17,6 +17,7 @@ Dieser Dienst stellt einen mandantenfähigen Auth‑Service bereit: Login, Regis
 
 ## Security Contract
 - `x-tenant-id` ist fuer tenant-gebundene Routen Pflicht.
+- Ausnahme: `POST /auth/login` ist **identity-first** und funktioniert ohne Tenant-Header (optional als Hint erlaubt).
 - JWT Access-Tokens werden validiert, revokte JTIs werden ueber Redis geprueft.
 - Secrets nur via `*_FILE`, keine Klartext-Secrets im Repo.
 
@@ -86,7 +87,7 @@ Die wichtigsten Bausteine:
 2. Gemeinsame Anforderungen für /auth‑Routen
 -------------------------------------------
 
-Alle `/auth/...`‑Routen laufen im Kontext des `tenantDbContextPlugin`:
+Alle tenant-gebundenen `/auth/...`‑Routen laufen im Kontext des `tenantDbContextPlugin`:
 
 - Header `x-tenant-id: <UUID>` ist Pflicht (sonst 400/500).
 - Pro Request wird ein RLS‑gebundener DB‑Client bereitgestellt:
@@ -95,6 +96,10 @@ Alle `/auth/...`‑Routen laufen im Kontext des `tenantDbContextPlugin`:
   - `SET LOCAL ROLE app_auth;`
   - `COMMIT/ROLLBACK` in Hooks.
 - Der Client steht in Handlers unter `(req as any).db`.
+
+`POST /auth/login` ist davon bewusst abweichend:
+- DB‑Kontext wird via `config.db=true` bereitgestellt (BEGIN + `SET LOCAL ROLE app_auth`),
+- Tenant wird **erst nach** erfolgreicher Passwortprüfung über DB‑Contract aufgelöst und danach per `set_config('app.tenant', ...)` gesetzt.
 
 Access‑Token:
 
@@ -116,7 +121,7 @@ Datei: `src/modules/identity/routes.ts`
 **POST /auth/login**
 
 - Header:
-  - `x-tenant-id: <tenant_uuid>`
+  - `x-tenant-id: <tenant_uuid>` (optional; wird als Hint für Tenant-Auswahl genutzt)
 - Body:
   - `email: string` – gültige E‑Mail
   - `password: string`

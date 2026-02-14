@@ -34,6 +34,12 @@ declare module "fastify" {
     tenant?: boolean;
 
     /**
+     * Wenn true, wird ein DB-Client + Transaktion bereitgestellt, auch wenn
+     * weder tenant noch auth aktiv sind (z. B. identity-first login).
+     */
+    db?: boolean;
+
+    /**
      * Optionaler AuthZ-Vertrag:
      * - permission: einzelne Berechtigung
      * - permissions: mehrere Berechtigungen (AND-Logik)
@@ -79,6 +85,7 @@ declare module "fastify" {
   interface RouteConfig {
     auth?: boolean;
     tenant?: boolean;
+    db?: boolean;
     permission?: string;
     permissions?: string[];
   }
